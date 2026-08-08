@@ -1,6 +1,6 @@
 //! A link must never hang a caller silently.
 //!
-//! Two failure modes are pinned here, both of which present as "the future simply never
+//! Three failure modes are pinned here, all of which present as "the future simply never
 //! resolves" — the worst shape a transport bug can take, because there is nothing to log and
 //! nothing to retry:
 //!
@@ -8,6 +8,8 @@
 //!    per-message cap, which no amount of waiting changes) must be refused, not retried forever.
 //! 2. Inbound traffic that nobody is waiting on must not be able to wedge the reader and, with
 //!    it, the routing of every correlated reply.
+//! 3. A late reply to a timed-out request must not be misrouted to a new waiter that was
+//!    assigned the same id after the timeout reclaimed it.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -149,4 +151,76 @@ async fn an_unanswered_request_errors_on_its_deadline() {
         outcome.is_err(),
         "an unanswered request resolved successfully"
     );
+}
+
+/// A late reply to a timed-out request must not be misrouted to a new waiter.
+///
+/// When a request times out its id is reclaimed immediately.  If ids are allocated
+/// lowest-free-first the *next* request receives the same id, and a delayed reply from the peer
+/// (answering the first request) is then delivered to the second waiter — silently wrong.
+///
+/// With a monotonic wrapping cursor the recycled id does not reappear until 65 535 other ids
+/// have been cycled, making accidental collision effectively impossible under normal concurrency.
+/// This test pins the regression: request A times out, request B is issued, the peer then sends
+/// A's reply before sending B's reply, and B must receive its own answer rather than A's.
+#[tokio::test]
+async fn a_late_reply_to_a_timed_out_request_is_not_misrouted_to_the_next_waiter() {
+    // Short timeout so request A expires quickly and B starts before the peer answers A.
+    let options = LinkOptions {
+        request_timeout: Duration::from_millis(200),
+        ..LinkOptions::default()
+    };
+    let (peer, mut peer_rx, requester, _requester_rx) = linked_pair(options).await;
+
+    // Send request A and wait for it to time out.
+    let a_id = {
+        // Peek at the id the peer will see by doing the request and capturing the timeout error.
+        // The peer_rx will deliver the message regardless.
+        let _ = tokio::time::timeout(
+            PATIENCE,
+            requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"question-A".to_vec())),
+        )
+        .await
+        .expect("request A should have timed out, not hung");
+        // Retrieve the id from the peer side so we can send a reply to it later.
+        peer_rx.recv().await.expect("peer receives question-A").id
+    };
+
+    // Now issue request B.  With a monotonic cursor it gets a *different* id than A.
+    let peer_task = tokio::spawn(async move {
+        let b_msg = peer_rx.recv().await.expect("peer receives question-B");
+
+        // Send A's late reply first (after A has already timed out), then B's real reply.
+        peer.send_message(DigMessage::new(
+            HOLDINGS_ANNOUNCE,
+            a_id,
+            Bytes::new(b"answer-to-A".to_vec()),
+        ))
+        .await
+        .expect("peer sends late answer-to-A");
+
+        peer.send_message(DigMessage::new(
+            HOLDINGS_ANNOUNCE,
+            b_msg.id,
+            Bytes::new(b"answer-to-B".to_vec()),
+        ))
+        .await
+        .expect("peer sends answer-to-B");
+    });
+
+    let b_response = tokio::time::timeout(
+        PATIENCE,
+        requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"question-B".to_vec())),
+    )
+    .await
+    .expect("request B hung")
+    .expect("request B errored");
+
+    assert_eq!(
+        b_response.data.as_ref(),
+        b"answer-to-B",
+        "MISROUTED: question-B received a reply intended for question-A"
+    );
+
+    peer_task.await.expect("peer task finished");
 }

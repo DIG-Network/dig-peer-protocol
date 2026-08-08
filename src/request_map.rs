@@ -30,6 +30,11 @@ pub(crate) struct RequestMap {
     /// Bounds concurrent requests to the size of the `u16` id space, so [`Self::insert`] always
     /// has a free id to hand out — it waits here rather than failing to find one.
     capacity: Arc<Semaphore>,
+    /// Monotonic wrapping cursor for id allocation.  Starting the search from `next_id` rather
+    /// than from 0 means a recycled id does not appear again until 65 535 other ids have been
+    /// used, so a late reply to a timed-out request cannot accidentally match a new waiter that
+    /// was allocated the same id moments later.
+    next_id: Mutex<u16>,
 }
 
 impl RequestMap {
@@ -37,6 +42,7 @@ impl RequestMap {
         Self {
             items: Mutex::new(HashMap::new()),
             capacity: Arc::new(Semaphore::new(u16::MAX as usize)),
+            next_id: Mutex::new(0),
         }
     }
 
@@ -55,9 +61,18 @@ impl RequestMap {
         // long-lived link does not leak its way up to the id ceiling.
         items.retain(|_, request| !request.sender.is_closed());
 
-        let id = (0..=u16::MAX)
-            .find(|candidate| !items.contains_key(candidate))
-            .expect("the semaphore bounds live requests below the id space");
+        // Advance the cursor monotonically so that a recycled id is not reissued until the full
+        // 65 535-id space has been cycled.  The semaphore guarantees at least one free slot.
+        let mut next_id = self.next_id.lock().await;
+        let mut id = *next_id;
+        loop {
+            if !items.contains_key(&id) {
+                break;
+            }
+            id = id.wrapping_add(1);
+        }
+        *next_id = id.wrapping_add(1);
+        drop(next_id);
 
         items.insert(
             id,
