@@ -17,6 +17,11 @@ chia-traits = "0.26"
 chia_streamable_macro = "0.26"
 chia-sha2 = "0.26"
 chia-ssl = "0.26"
+# LOCKSTEP: chia-sdk-client and chia-protocol must be bumped together.
+# src/rate_limit.rs re-keys V2_RATE_LIMITS through chia_protocol::ProtocolMessageTypes —
+# the derived opcode bytes are correct only while sdk-client's RateLimits is keyed by the
+# same ProtocolMessageTypes type imported from chia-protocol 0.26.  Bumping either crate
+# alone can silently shift the derived opcode bytes without a compile error.
 chia-sdk-client = { version = "0.28", default-features = false }
 
 # Serialization for DigMessageType
