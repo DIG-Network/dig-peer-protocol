@@ -3,10 +3,23 @@
 //! DIG Network L2 protocol types — a superset of `chia-protocol`.
 //!
 //! This crate re-exports the entire Chia protocol ecosystem (`chia-protocol`,
-//! `chia-sdk-client`, `chia-ssl`, `chia-traits`) plus DIG-specific extensions
-//! (the `200..=219` consensus opcodes plus [`DIG_MESSAGE`] = 220, the directed
-//! dig-message envelope opcode). Consumers depend on `dig-peer-protocol` alone instead
-//! of importing multiple `chia-*` crates individually.
+//! `chia-sdk-client`, `chia-ssl`, `chia-traits`) plus DIG's own extensions: the
+//! `200..=222` opcode band, the [`DigMessage`] framing that can express it, and
+//! [`DigLink`], the websocket peer link that carries it. Consumers depend on
+//! `dig-peer-protocol` alone instead of importing multiple `chia-*` crates individually.
+//!
+//! ## The closed-enum problem, and how this crate closes it
+//!
+//! `chia_protocol::Message` stores its opcode as `ProtocolMessageTypes`, an enum that stops
+//! at `RespondCostInfo = 107` with no `Unknown(u8)` and private `Message` fields. A DIG opcode
+//! is therefore neither constructible nor decodable through it — and worse, `chia-sdk-client`'s
+//! receive loop calls `Message::from_bytes`, so one inbound DIG frame drops the whole
+//! connection rather than that one frame.
+//!
+//! [`DigMessage`] answers the first half: the same wire bytes with a raw `u8` opcode.
+//! [`DigLink`] answers the second: a websocket link that frames `DigMessage` end to end.
+//! Together they replace the vendored `chia-protocol` / `chia-sdk-client` forks DIG used to
+//! carry, so `chia-protocol` is an ordinary dependency with no `[patch.crates-io]`.
 //!
 //! ## What's included
 //!
@@ -17,17 +30,20 @@
 //! | `chia-ssl` | `ChiaCertificate` |
 //! | `chia-traits` | `Streamable` trait |
 //! | `chia_streamable_macro` | `#[streamable]` proc macro |
-//! | **DIG extensions** | `DigMessage`, `DigMessageType`, `RegisterPeer`, `RegisterAck`, introducer wire types |
+//! | **DIG extensions** | `DigMessage`, `DigMessageType`, the `200..=222` opcode band, `RegisterPeer`, `RegisterAck`, introducer wire types |
+//! | **DIG peer link** | `DigLink`, `LinkOptions`, `LinkError`, `OpcodeRateLimiter`, `OpcodeRateLimits` |
 //!
 //! ## Feature flags
 //!
 //! | Flag | Forwards to | Effect |
 //! |------|-------------|--------|
-//! | `native-tls` | `chia-sdk-client/native-tls` | OS-native TLS; enables `Client`, `ClientState`, `Connector`, `create_native_tls_connector` |
-//! | `rustls` | `chia-sdk-client/rustls` | Pure-Rust TLS; enables `Client`, `ClientState`, `Connector`, `create_rustls_connector` |
+//! | `native-tls` | `chia-sdk-client/native-tls` | OS-native TLS; enables `Client`, `ClientState`, `Connector`, `create_native_tls_connector`, `DigLink::connect` |
+//! | `rustls` | `chia-sdk-client/rustls` | Pure-Rust TLS; enables `Client`, `ClientState`, `Connector`, `create_rustls_connector`, `DigLink::connect` |
 //!
 //! Neither feature is enabled by default. The crate builds without either but TLS-dependent
-//! re-exports (`Client`, `ClientState`, `Connector`) become unavailable.
+//! items (`Client`, `ClientState`, `Connector`, and `DigLink::connect`) become unavailable;
+//! [`DigLink::from_websocket`] and [`DigLink::from_server_websocket`] stay available, since
+//! adopting an already-established socket needs no TLS backend of its own.
 
 // ============================================================================
 // Re-export: chia-protocol (all wire types)
@@ -74,25 +90,25 @@ pub use chia_streamable_macro::streamable;
 // ============================================================================
 mod dig_message;
 mod dig_message_type;
+mod error;
 mod introducer_wire;
+mod link;
+mod opcodes;
+mod rate_limit;
+mod request_map;
 
 pub use dig_message::DigMessage;
 pub use dig_message_type::{DigMessageType, UnknownDigMessageType};
+pub use error::LinkError;
 pub use introducer_wire::{
     RegisterAck, RegisterPeer, RequestPeersIntroducer, RespondPeersIntroducer,
 };
-
-/// Wire opcode for a directed **dig-message** envelope (WU6, epic #796).
-///
-/// The `200..=219` band is the DIG L2 **consensus** band ([`DigMessageType`]); `220..=255`
-/// is the **free** band for directed application protocols. Opcode **220** carries a
-/// `dig-message` directed envelope as OPAQUE bytes in [`DigMessage::data`] — the transport
-/// (dig-gossip) never seals, opens, or parses it; end-to-end sealing to the recipient's DID
-/// key is `dig-message`'s job.
-///
-/// This is a cross-repo **canonical** constant — it MUST NOT drift. `dig-gossip` mirrors it
-/// as `dig_gossip::DIG_MESSAGE` (and `ProtocolMessageTypes::DigMessage`) for its transport.
-pub const DIG_MESSAGE: u8 = 220;
+pub use link::{DigLink, LinkOptions};
+pub use opcodes::{
+    is_dig_opcode, ALL_DIG_OPCODES, DIG_BAND_START, DIG_MESSAGE, FREE_BAND_START,
+    HOLDINGS_ANNOUNCE, STORE_MELTED,
+};
+pub use rate_limit::{OpcodeRateLimiter, OpcodeRateLimits};
 
 #[cfg(test)]
 mod dig_message_opcode_tests {
