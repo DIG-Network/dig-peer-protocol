@@ -9,6 +9,15 @@
 //! would have created a second set of numbers to drift; deriving them means a Chia opcode is
 //! rate-limited exactly as a stock peer would rate-limit it, forever.
 //!
+//! ## Lockstep pin (do not relax)
+//!
+//! Deriving buys correctness at the price of one coupling: `V2_RATE_LIMITS` comes from
+//! `chia-sdk-client` and is keyed by `chia_protocol::ProtocolMessageTypes`, so the two crates
+//! MUST resolve to a single version of that enum. If they ever diverge, `rekey` would key the
+//! table by the *other* crate's discriminants and every Chia opcode would silently fall to
+//! `default_settings` — a loosening, with no compile error. Bump `chia-protocol` and
+//! `chia-sdk-client` together, and never pin them independently.
+//!
 //! [`DigLink`]: crate::DigLink
 
 use std::{
@@ -61,6 +70,21 @@ impl Default for OpcodeRateLimits {
     }
 }
 
+/// The verdict on one outbound message.
+///
+/// Refusal is split in two because the two halves demand opposite caller behaviour: one is
+/// worth waiting out, the other is a permanent error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// May be sent now; its cost has been charged to the current window.
+    Admitted,
+    /// Refused for now, but a later window could admit it — the budget it exhausted resets.
+    Deferred,
+    /// Refused in every window: the message exceeds a per-message or whole-window bound, so
+    /// waiting can never help.
+    Unsendable,
+}
+
 /// A sliding-window outbound limiter over [`OpcodeRateLimits`].
 ///
 /// Mirrors Chia's algorithm: per-period per-opcode count and cumulative size, plus an aggregate
@@ -100,43 +124,72 @@ impl OpcodeRateLimiter {
     ///
     /// A refused message is NOT charged, so a caller that backs off and retries is not
     /// permanently penalised for having asked early.
+    ///
+    /// Prefer [`Self::admit`] where the caller intends to retry: `true`/`false` cannot say
+    /// whether waiting could ever help.
     pub fn allow(&mut self, message: &DigMessage) -> bool {
+        self.admit(message) == Admission::Admitted
+    }
+
+    /// Whether `message` may be sent now — and, when it may not, whether waiting could help.
+    ///
+    /// The distinction is what keeps a caller from spinning forever: a *frequency* or
+    /// *cumulative* budget clears on the next window roll, but a message larger than the
+    /// per-message cap (or than a whole window's budget) is refused identically in every window
+    /// that will ever exist. Only [`Admission::Deferred`] is worth retrying.
+    pub fn admit(&mut self, message: &DigMessage) -> Admission {
         self.roll_window();
 
         let size = f64::from(u32::try_from(message.data.len()).unwrap_or(u32::MAX));
         let opcode = message.msg_type;
 
-        let new_count = self.counts.get(&opcode).unwrap_or(&0.0) + 1.0;
-        let new_cumulative = self.cumulative_sizes.get(&opcode).unwrap_or(&0.0) + size;
-        let mut new_non_tx_count = self.non_tx_count;
-        let mut new_non_tx_size = self.non_tx_size;
-
         let mut limit = self.limits.default_settings;
+        let mut counts_against_non_tx = false;
         if let Some(tx_limit) = self.limits.tx.get(&opcode) {
             limit = *tx_limit;
         } else if let Some(other_limit) = self.limits.other.get(&opcode) {
             limit = *other_limit;
-            new_non_tx_count += 1.0;
-            new_non_tx_size += size;
+            counts_against_non_tx = true;
         }
 
-        let non_tx_ok = new_non_tx_count <= self.limits.non_tx_frequency * self.limit_factor
-            && new_non_tx_size <= self.limits.non_tx_max_total_size * self.limit_factor;
         let max_total = limit
             .max_total_size
             .unwrap_or(limit.frequency * limit.max_size);
-        let allowed = non_tx_ok
+
+        // Measured against an EMPTY window, so it isolates the budgets a window roll cannot
+        // clear. A message failing here is unsendable on this link, permanently.
+        let fits_an_empty_window = size <= limit.max_size
+            && size <= max_total * self.limit_factor
+            && 1.0 <= limit.frequency * self.limit_factor
+            && (!counts_against_non_tx
+                || (1.0 <= self.limits.non_tx_frequency * self.limit_factor
+                    && size <= self.limits.non_tx_max_total_size * self.limit_factor));
+        if !fits_an_empty_window {
+            return Admission::Unsendable;
+        }
+
+        let new_count = self.counts.get(&opcode).unwrap_or(&0.0) + 1.0;
+        let new_cumulative = self.cumulative_sizes.get(&opcode).unwrap_or(&0.0) + size;
+        let (new_non_tx_count, new_non_tx_size) = if counts_against_non_tx {
+            (self.non_tx_count + 1.0, self.non_tx_size + size)
+        } else {
+            (self.non_tx_count, self.non_tx_size)
+        };
+
+        let allowed = new_non_tx_count <= self.limits.non_tx_frequency * self.limit_factor
+            && new_non_tx_size <= self.limits.non_tx_max_total_size * self.limit_factor
             && new_count <= limit.frequency * self.limit_factor
-            && size <= limit.max_size
             && new_cumulative <= max_total * self.limit_factor;
 
-        if allowed {
-            self.counts.insert(opcode, new_count);
-            self.cumulative_sizes.insert(opcode, new_cumulative);
-            self.non_tx_count = new_non_tx_count;
-            self.non_tx_size = new_non_tx_size;
+        if !allowed {
+            return Admission::Deferred;
         }
-        allowed
+
+        self.counts.insert(opcode, new_count);
+        self.cumulative_sizes.insert(opcode, new_cumulative);
+        self.non_tx_count = new_non_tx_count;
+        self.non_tx_size = new_non_tx_size;
+        Admission::Admitted
     }
 
     /// Clear the accumulated budget when the wall clock crosses into a new window.
@@ -162,7 +215,7 @@ fn now_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpcodeRateLimiter, OpcodeRateLimits};
+    use super::{Admission, OpcodeRateLimiter, OpcodeRateLimits};
     use crate::{DigMessage, DIG_MESSAGE};
     use chia_protocol::{Bytes, ProtocolMessageTypes};
     use chia_traits::Streamable;
@@ -222,6 +275,39 @@ mod tests {
         assert!(
             !limiter.allow(&message(DIG_MESSAGE, 1)),
             "one message over the bound was admitted"
+        );
+    }
+
+    /// The two refusals are distinguishable, which is the whole point of [`Admission`]: one
+    /// clears on the next window, the other never does.
+    ///
+    /// Both cases are driven on the SAME opcode and the same limiter shape, so the only thing
+    /// separating them is which budget was exceeded — an implementation that collapsed them into
+    /// a single "refused" verdict could not pass both halves.
+    #[test]
+    fn a_deferrable_refusal_is_distinguished_from_a_permanent_one() {
+        let limits = OpcodeRateLimits::default();
+        let allowance = limits.default_settings.frequency as usize;
+        let max_size = limits.default_settings.max_size as usize;
+
+        let mut exhausted = OpcodeRateLimiter::new(60, 1.0, limits);
+        for _ in 0..allowance {
+            assert_eq!(
+                exhausted.admit(&message(DIG_MESSAGE, 1)),
+                Admission::Admitted
+            );
+        }
+        assert_eq!(
+            exhausted.admit(&message(DIG_MESSAGE, 1)),
+            Admission::Deferred,
+            "an exhausted frequency budget resets on the next window, so waiting can help"
+        );
+
+        let mut fresh = OpcodeRateLimiter::new(60, 1.0, OpcodeRateLimits::default());
+        assert_eq!(
+            fresh.admit(&message(DIG_MESSAGE, max_size + 1)),
+            Admission::Unsendable,
+            "an oversized message is refused identically in every window"
         );
     }
 

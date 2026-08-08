@@ -289,8 +289,8 @@ a breaking change to every consumer; additions are non-breaking.
 
 `DigLink` is a websocket link to one peer that frames every message as a `DigMessage`. It
 exists because `chia_sdk_client::Peer` cannot carry DIG opcodes: `chia_protocol::Message`
-stores `msg_type` as the closed `ProtocolMessageTypes` enum with private fields, so a DIG
-opcode is neither constructible nor decodable there.
+stores `msg_type` as the closed `ProtocolMessageTypes` enum, which has no value for a DIG
+opcode, so a DIG opcode is neither constructible nor decodable there.
 
 ### 7.1 Framing and decoding
 
@@ -302,6 +302,12 @@ opcode is neither constructible nor decodable there.
    the receive loop, dropping a connection over a single well-formed DIG frame.
 3. Non-binary frames are handled without affecting message flow: `Close` ends the loop;
    `Ping`/`Pong` are ignored; `Text` is logged and ignored.
+4. A binary frame that does not decode as a `DigMessage` MUST end the receive loop with
+   `LinkError::MalformedFrame`. This is a deliberate asymmetry with rule 2: an *unknown
+   opcode* is a normal message, but a frame whose length prefix or structure is invalid
+   leaves the stream position untrustworthy, so continuing would decode subsequent frames
+   from an unknown offset. It is recorded here because it means one malformed frame still
+   drops the link — a narrower version of the failure this link exists to remove.
 
 ### 7.2 Inbound routing (normative)
 
@@ -309,18 +315,31 @@ A decoded message is routed by correlation id:
 
 - `id == None` → delivered to the application channel.
 - `id == Some(n)` **and** a live request waiter holds `n` → delivered to that waiter.
-- `id == Some(n)` and **no** waiter holds `n` → delivered to the application channel.
+- `id == Some(n)` and **no** waiter holds `n` → delivered to the application channel on a
+  best-effort basis (see below).
 
 The third rule is required, not an optimisation. Each side allocates ids from its own
 space, so an inbound *request* id routinely collides with an outstanding outbound request
 id. An implementation MUST NOT treat an unmatched id as fatal: doing so lets any peer drop
 the link at will by sending one unknown id, and misroutes ordinary inbound requests.
 
+**Delivery to the application MUST NOT block the receive loop.** The application channel is
+bounded; when it is full, the frame MUST be dropped and logged rather than awaited. Blocking
+here is a denial of service: a peer that emits ids nobody is waiting on fills the channel,
+the loop parks, and from that moment **no correlated reply is routed at all** — every
+outstanding request hangs with no error and no recovery. Correlated routing has no fallback
+path, so it MUST NOT be able to queue behind unmatched traffic. Loss of an unmatched inbound
+frame under overload is permitted and expected.
+
 ### 7.3 Correlated requests
 
 `request_raw` / `request_dig` / `request_infallible` / `request_fallible` MUST allocate an
 unused `u16` id, send with that id, and resolve when a message bearing it arrives.
-Concurrent requests MUST be bounded by the id space so an id is always available. A reply
+Concurrent requests MUST be bounded by the id space so an id is always available.
+
+Every request MUST carry a deadline (`LinkOptions::request_timeout`). On expiry the request
+MUST fail with `LinkError::RequestTimeout` and its id MUST be reclaimed immediately, so a
+silent peer can neither hang the caller indefinitely nor exhaust the id space. A reply
 whose opcode matches none of the expected ones MUST fail with `LinkError::InvalidResponse`
 carrying the raw opcodes — never a `ProtocolMessageTypes`, which cannot name a DIG opcode.
 
@@ -330,7 +349,20 @@ Outbound messages MUST pass an `OpcodeRateLimiter` before being written. Its lim
 **derived** from Chia's `V2_RATE_LIMITS` by re-keying each entry to its wire byte, so a
 Chia opcode is limited exactly as a stock peer limits it; DIG opcodes have no upstream
 entry and fall to `default_settings`. A refused message MUST NOT be charged against the
-budget, and the sender retries after a backoff rather than failing.
+budget.
+
+A refusal MUST be classified, because the two kinds demand opposite behaviour:
+
+| Verdict | Meaning | Required sender behaviour |
+|---|---|---|
+| `Admission::Admitted` | within budget, charged | write the frame |
+| `Admission::Deferred` | over a budget that a window roll resets | back off and retry, bounded by `LinkOptions::send_timeout`, then fail with `LinkError::SendTimeout` |
+| `Admission::Unsendable` | refused even against an empty window (e.g. larger than the per-message `max_size`) | fail immediately with `LinkError::Unsendable` |
+
+A sender MUST NOT retry an `Unsendable` message. No window will ever admit it, so retrying
+is an unbounded loop that returns neither success nor error — the caller simply disappears.
+A `HoldingsAnnounce` batch above the 1 MiB `default_settings.max_size` is the concrete case:
+it must be split by the caller, not waited on.
 
 ### 7.5 Construction
 

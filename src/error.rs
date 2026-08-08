@@ -42,6 +42,19 @@ pub enum LinkError {
     #[error("the websocket's TLS backend is not supported by this build")]
     UnsupportedTls,
 
+    /// The message exceeds a rate-limit bound no window will ever admit — typically the
+    /// per-message size cap. Retrying is futile; the body must be split.
+    #[error("a message with opcode {0} and a {1}-byte body exceeds the per-message limit")]
+    Unsendable(u8, usize),
+
+    /// Rate-limit budget did not free up within `LinkOptions::send_timeout`.
+    #[error("timed out waiting for rate-limit budget to send opcode {0}")]
+    SendTimeout(u8),
+
+    /// No correlated reply arrived within `LinkOptions::request_timeout`.
+    #[error("timed out waiting for a response to opcode {0}")]
+    RequestTimeout(u8),
+
     /// A Chia message type did not encode to a single-byte opcode. Unreachable with any real
     /// `ChiaProtocolMessage`; present so the encoding is never silently assumed.
     #[error("message type did not encode to a single-byte opcode")]

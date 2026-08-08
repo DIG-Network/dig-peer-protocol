@@ -6,7 +6,9 @@
 //! `ProtocolMessageTypes` enum (it stops at `RespondCostInfo = 107`, with no `Unknown(u8)` and no
 //! `#[non_exhaustive]`). Two consequences make it unusable as a DIG transport:
 //!
-//! 1. `Message`'s fields are private upstream, so a DIG opcode is not even *constructible*.
+//! 1. A DIG opcode has no `ProtocolMessageTypes` value, so no `Message` can name one. The
+//!    fields are public — `tests/wire_compatibility.rs` builds one with a struct literal — but
+//!    the closed enum is a sufficient blocker on its own.
 //! 2. Its inbound loop calls `Message::from_bytes`, which returns `Err` on any unknown opcode —
 //!    and that error terminates the receive loop. A single inbound DIG frame therefore kills the
 //!    whole connection, not just that frame.
@@ -37,7 +39,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, warn};
 
 use crate::{
-    rate_limit::{OpcodeRateLimiter, OpcodeRateLimits},
+    rate_limit::{Admission, OpcodeRateLimiter, OpcodeRateLimits},
     request_map::RequestMap,
     DigMessage, LinkError,
 };
@@ -59,12 +61,28 @@ const RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 pub struct LinkOptions {
     /// Scales every outbound rate-limit budget. `1.0` is the nominal Chia allowance.
     pub rate_limit_factor: f64,
+
+    /// How long [`DigLink::send_message`] may wait for rate-limit budget before giving up.
+    ///
+    /// Only a *deferrable* refusal waits at all — an oversized message is refused immediately,
+    /// since no amount of waiting makes it fit.
+    pub send_timeout: Duration,
+
+    /// How long a correlated request waits for its reply before erroring.
+    ///
+    /// Without a deadline a silent or wedged peer leaves the caller pending forever, which is
+    /// indistinguishable from a lost future.
+    pub request_timeout: Duration,
 }
 
 impl Default for LinkOptions {
     fn default() -> Self {
         Self {
             rate_limit_factor: 0.6,
+            // Two full windows: long enough that a genuinely transient budget exhaustion always
+            // clears (a roll resets every counter), short enough to surface a stuck sender.
+            send_timeout: Duration::from_secs(RATE_LIMIT_WINDOW_SECONDS * 2),
+            request_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -96,6 +114,7 @@ struct LinkInner {
     requests: Arc<RequestMap>,
     socket_addr: SocketAddr,
     outbound_rate_limiter: Mutex<OpcodeRateLimiter>,
+    options: LinkOptions,
 }
 
 // Hand-written because `BoxedSink`/`JoinHandle` carry no useful `Debug`; only the stable,
@@ -207,6 +226,7 @@ impl DigLink {
                 options.rate_limit_factor,
                 OpcodeRateLimits::default(),
             )),
+            options,
         }));
 
         (link, receiver)
@@ -244,21 +264,35 @@ impl DigLink {
     ///
     /// This is how an inbound *request* is answered: the reply must carry the requester's id,
     /// which neither [`Self::send`] nor [`Self::send_dig`] can express.
+    /// Rate-limit refusals are handled by kind, never by blanket retry: an over-budget message
+    /// waits for the next window (up to [`LinkOptions::send_timeout`]), while a message that no
+    /// window could ever admit fails immediately. Retrying the latter is an infinite loop with
+    /// no error, which is how a caller silently disappears.
     pub async fn send_message(&self, message: DigMessage) -> Result<(), LinkError> {
+        let deadline = tokio::time::Instant::now() + self.0.options.send_timeout;
+
         loop {
-            if !self.0.outbound_rate_limiter.lock().await.allow(&message) {
-                tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
-                continue;
+            match self.0.outbound_rate_limiter.lock().await.admit(&message) {
+                Admission::Admitted => break,
+                Admission::Unsendable => {
+                    return Err(LinkError::Unsendable(message.msg_type, message.data.len()))
+                }
+                Admission::Deferred => {}
             }
 
-            self.0
-                .sink
-                .lock()
-                .await
-                .send(tungstenite::Message::Binary(message.to_bytes()))
-                .await?;
-            return Ok(());
+            if tokio::time::Instant::now() + RATE_LIMIT_BACKOFF > deadline {
+                return Err(LinkError::SendTimeout(message.msg_type));
+            }
+            tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
         }
+
+        self.0
+            .sink
+            .lock()
+            .await
+            .send(tungstenite::Message::Binary(message.to_bytes()))
+            .await?;
+        Ok(())
     }
 
     /// Send a Chia-typed body and await the correlated reply, unparsed.
@@ -312,12 +346,29 @@ impl DigLink {
     }
 
     /// Register a correlation id, send, and await the reply routed back to it.
+    ///
+    /// The wait is bounded by [`LinkOptions::request_timeout`]. On expiry the id is reclaimed
+    /// immediately rather than left occupying the map until the link drops — an unbounded wait
+    /// against a silent peer leaks ids as well as hanging the caller.
     async fn request_message(&self, opcode: u8, data: Bytes) -> Result<DigMessage, LinkError> {
         let (sender, receiver) = oneshot::channel();
         let id = self.0.requests.insert(sender).await;
-        self.send_message(DigMessage::new(opcode, Some(id), data))
-            .await?;
-        Ok(receiver.await?)
+
+        if let Err(error) = self
+            .send_message(DigMessage::new(opcode, Some(id), data))
+            .await
+        {
+            self.0.requests.remove(id).await;
+            return Err(error);
+        }
+
+        match tokio::time::timeout(self.0.options.request_timeout, receiver).await {
+            Ok(received) => Ok(received?),
+            Err(_) => {
+                self.0.requests.remove(id).await;
+                Err(LinkError::RequestTimeout(opcode))
+            }
+        }
     }
 
     /// Close the connection.
@@ -362,6 +413,16 @@ fn peer_addr_of(ws: &WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Socke
 ///    collides with one of our outstanding request ids; and a hostile peer could drop the link at
 ///    will by sending one unknown id. Here, anything not matching a live waiter goes to the
 ///    application, which is where an inbound request belongs anyway.
+///
+/// ## Why unmatched frames are dropped rather than queued
+///
+/// Delivery to the application is non-blocking: a full inbound channel drops the frame instead
+/// of parking the loop. Parking looks harmless and is not — a peer that floods ids nobody is
+/// waiting on fills the channel, the loop stops, and from then on **no correlated reply is ever
+/// routed**, so every outstanding request hangs with no error. Correlated routing is the one
+/// thing on this link that has no fallback, so it is never allowed to queue behind traffic the
+/// application has not kept up with. A dropped inbound frame is a visible, recoverable loss on
+/// a best-effort transport; a wedged reader is not.
 async fn read_inbound(
     mut stream: BoxedStream,
     sender: mpsc::Sender<DigMessage>,
@@ -380,16 +441,23 @@ async fn read_inbound(
                     return Err(LinkError::MalformedFrame);
                 };
 
-                match message.id {
+                let unmatched = match message.id {
                     Some(id) => match requests.remove(id).await {
-                        Some(waiter) => waiter.send(message),
-                        None => {
-                            sender.send(message).await.ok();
+                        Some(waiter) => {
+                            waiter.send(message);
+                            continue;
                         }
+                        None => message,
                     },
-                    None => {
-                        sender.send(message).await.ok();
-                    }
+                    None => message,
+                };
+
+                if let Err(mpsc::error::TrySendError::Full(dropped)) = sender.try_send(unmatched) {
+                    warn!(
+                        "dig link dropped an inbound frame (opcode {}): the application is not \
+                         keeping up",
+                        dropped.msg_type
+                    );
                 }
             }
         }

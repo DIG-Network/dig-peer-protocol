@@ -11,8 +11,8 @@
 //! ## The closed-enum problem, and how this crate closes it
 //!
 //! `chia_protocol::Message` stores its opcode as `ProtocolMessageTypes`, an enum that stops
-//! at `RespondCostInfo = 107` with no `Unknown(u8)` and private `Message` fields. A DIG opcode
-//! is therefore neither constructible nor decodable through it — and worse, `chia-sdk-client`'s
+//! at `RespondCostInfo = 107` with no `Unknown(u8)`. A DIG opcode has no value in that enum, so
+//! it is neither constructible nor decodable through it — and worse, `chia-sdk-client`'s
 //! receive loop calls `Message::from_bytes`, so one inbound DIG frame drops the whole
 //! connection rather than that one frame.
 //!
@@ -31,7 +31,7 @@
 //! | `chia-traits` | `Streamable` trait |
 //! | `chia_streamable_macro` | `#[streamable]` proc macro |
 //! | **DIG extensions** | `DigMessage`, `DigMessageType`, the `200..=222` opcode band, `RegisterPeer`, `RegisterAck`, introducer wire types |
-//! | **DIG peer link** | `DigLink`, `LinkOptions`, `LinkError`, `OpcodeRateLimiter`, `OpcodeRateLimits` |
+//! | **DIG peer link** | `DigLink`, `LinkOptions`, `LinkError`, `Admission`, `OpcodeRateLimiter`, `OpcodeRateLimits` |
 //!
 //! ## Feature flags
 //!
@@ -108,7 +108,7 @@ pub use opcodes::{
     is_dig_opcode, ALL_DIG_OPCODES, DIG_BAND_START, DIG_MESSAGE, FREE_BAND_START,
     HOLDINGS_ANNOUNCE, STORE_MELTED,
 };
-pub use rate_limit::{OpcodeRateLimiter, OpcodeRateLimits};
+pub use rate_limit::{Admission, OpcodeRateLimiter, OpcodeRateLimits};
 
 #[cfg(test)]
 mod dig_message_opcode_tests {
