@@ -25,10 +25,6 @@ pub enum LinkError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// A binary frame was not a well-formed message.
-    #[error("received a malformed frame")]
-    MalformedFrame,
-
     /// The peer replied with an opcode none of the expected ones matched.
     #[error("expected a response with opcode in {0:?}, found {1}")]
     InvalidResponse(Vec<u8>, u8),

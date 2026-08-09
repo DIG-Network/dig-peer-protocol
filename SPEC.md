@@ -302,12 +302,19 @@ opcode, so a DIG opcode is neither constructible nor decodable there.
    the receive loop, dropping a connection over a single well-formed DIG frame.
 3. Non-binary frames are handled without affecting message flow: `Close` ends the loop;
    `Ping`/`Pong` are ignored; `Text` is logged and ignored.
-4. A binary frame that does not decode as a `DigMessage` MUST end the receive loop with
-   `LinkError::MalformedFrame`. This is a deliberate asymmetry with rule 2: an *unknown
-   opcode* is a normal message, but a frame whose length prefix or structure is invalid
-   leaves the stream position untrustworthy, so continuing would decode subsequent frames
-   from an unknown offset. It is recorded here because it means one malformed frame still
-   drops the link — a narrower version of the failure this link exists to remove.
+4. A binary frame that does not decode as a `DigMessage` MUST be logged and skipped. The
+   receive loop MUST continue, and the next frame MUST be decoded and routed normally. An
+   implementation MUST NOT treat a malformed frame as fatal.
+
+   Websocket frames are self-delimiting: the transport delivers whole binary payloads and
+   the receive loop never reads a length off a byte stream, so an undecodable payload costs
+   exactly that payload and cannot desynchronise anything that follows it. Ending the loop
+   would therefore buy no integrity, while restoring the same one-frame kill switch rule 2
+   and §7.2 exist to remove — any peer, hostile or merely running a version whose framing
+   this build does not parse, could drop the link by sending three bytes. It would also fail
+   *silently*: the reader stops, but outstanding requests remain registered and resolve only
+   when their own deadlines (§7.3) expire, so callers observe an unexplained stall rather
+   than a closed connection.
 
 ### 7.2 Inbound routing (normative)
 
@@ -339,7 +346,16 @@ Concurrent requests MUST be bounded by the id space so an id is always available
 
 Every request MUST carry a deadline (`LinkOptions::request_timeout`). On expiry the request
 MUST fail with `LinkError::RequestTimeout` and its id MUST be reclaimed immediately, so a
-silent peer can neither hang the caller indefinitely nor exhaust the id space. A reply
+silent peer can neither hang the caller indefinitely nor exhaust the id space.
+
+Ids MUST be allocated from a monotonically advancing wrapping cursor rather than
+lowest-free-first, so a reclaimed id is not reissued until the id space has wrapped. Reclaiming
+an id at the deadline otherwise hands it straight to the next request, and a reply that arrives
+late — answering the request that already timed out — then matches the new waiter and is
+delivered to it as though it were that request's answer. Nothing downstream can detect the
+substitution, so this MUST be prevented at allocation.
+
+A reply
 whose opcode matches none of the expected ones MUST fail with `LinkError::InvalidResponse`
 carrying the raw opcodes — never a `ProtocolMessageTypes`, which cannot name a DIG opcode.
 
@@ -431,6 +447,8 @@ Runtime configuration is limited to `LinkOptions` (§7), which scales the outbou
 | C11 | An inbound DIG opcode (218) is decoded and delivered, and the link survives it — where `Message::from_bytes` would reject the same frame and end the loop | §7.1; `tests/inbound_dig_opcode.rs` |
 | C12 | An inbound message whose id matches no live waiter is delivered to the application, not treated as fatal | §7.2; `tests/inbound_dig_opcode.rs` |
 | C13 | Chia opcodes keep their upstream rate limits under the re-keyed table; DIG opcodes fall to `default_settings`; budgets are enforced from both sides of the bound | §7.4; tests in `src/rate_limit.rs` |
+| C14 | A malformed binary frame is skipped, not fatal: the frame that follows it still decodes and routes to its correlated waiter | §7.1 rule 4; `tests/inbound_dig_opcode.rs` |
+| C15 | A late reply to a request that has already timed out is never delivered to a subsequent waiter | §7.3; `tests/link_liveness.rs` |
 
 Peer implementations (any language) MUST reproduce C1–C6 and C10 byte-for-byte to interoperate
 with DIG nodes. The gossip layer consuming these opcodes and the introducer/relay

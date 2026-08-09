@@ -86,10 +86,8 @@ async fn a_flood_of_unmatched_ids_cannot_wedge_the_correlated_reply_path() {
     // The nominal Chia allowance, so the flood is bounded by the inbound channel under test
     // rather than by the sender's own outbound budget — which would stall the fixture and make
     // the test fail for a reason unrelated to routing.
-    let options = LinkOptions {
-        rate_limit_factor: 1.0,
-        ..LinkOptions::default()
-    };
+    let mut options = LinkOptions::default();
+    options.rate_limit_factor = 1.0;
     let (peer, mut peer_rx, requester, _requester_rx) = linked_pair(options).await;
 
     let peer_task = tokio::spawn(async move {
@@ -134,10 +132,8 @@ async fn a_flood_of_unmatched_ids_cannot_wedge_the_correlated_reply_path() {
 /// deadline exists for.
 #[tokio::test]
 async fn an_unanswered_request_errors_on_its_deadline() {
-    let options = LinkOptions {
-        request_timeout: Duration::from_millis(300),
-        ..LinkOptions::default()
-    };
+    let mut options = LinkOptions::default();
+    options.request_timeout = Duration::from_millis(300);
     let (_peer, _peer_rx, requester, _requester_rx) = linked_pair(options).await;
 
     let outcome = tokio::time::timeout(
@@ -166,10 +162,8 @@ async fn an_unanswered_request_errors_on_its_deadline() {
 #[tokio::test]
 async fn a_late_reply_to_a_timed_out_request_is_not_misrouted_to_the_next_waiter() {
     // Short timeout so request A expires quickly and B starts before the peer answers A.
-    let options = LinkOptions {
-        request_timeout: Duration::from_millis(200),
-        ..LinkOptions::default()
-    };
+    let mut options = LinkOptions::default();
+    options.request_timeout = Duration::from_millis(200);
     let (peer, mut peer_rx, requester, _requester_rx) = linked_pair(options).await;
 
     // Send request A and wait for it to time out.

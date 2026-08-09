@@ -15,6 +15,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use chia_protocol::{Bytes, Message, ProtocolMessageTypes};
 use chia_traits::Streamable;
 use dig_peer_protocol::{DigLink, DigMessage, DigMessageType, LinkOptions};
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::DuplexStream;
 use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
 
@@ -45,6 +46,30 @@ async fn linked_pair() -> (
     let (b, b_rx) = DigLink::from_server_websocket(server, addr, LinkOptions::default());
     (a, a_rx, b, b_rx)
 }
+
+/// One [`DigLink`] joined to a RAW websocket, so a test can put bytes on the wire that no
+/// `DigLink` would ever emit — a malformed frame, in particular.
+async fn link_with_raw_peer() -> (
+    DigLink,
+    tokio::sync::mpsc::Receiver<DigMessage>,
+    WebSocketStream<DuplexStream>,
+) {
+    let (left, right) = tokio::io::duplex(64 * 1024);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8444));
+
+    let client: WebSocketStream<DuplexStream> =
+        WebSocketStream::from_raw_socket(left, Role::Client, None).await;
+    let raw: WebSocketStream<DuplexStream> =
+        WebSocketStream::from_raw_socket(right, Role::Server, None).await;
+
+    let (link, link_rx) = DigLink::from_server_websocket(client, addr, LinkOptions::default());
+    (link, link_rx, raw)
+}
+
+/// Three bytes claiming a correlation id that is not there: `has_id` is set but the two id bytes
+/// are missing, so `from_bytes_owned` rejects it. Short enough to be unambiguous, and asserted
+/// undecodable by the test that uses it rather than assumed.
+const MALFORMED_FRAME: [u8; 3] = [0xFF, 0x01, 0x00];
 
 /// Await the next inbound message, failing the test rather than hanging if none arrives.
 async fn next(rx: &mut tokio::sync::mpsc::Receiver<DigMessage>) -> DigMessage {
@@ -185,4 +210,85 @@ async fn a_dig_request_correlates_with_its_response() {
     assert_eq!(response.msg_type, DigMessageType::RespondStatus as u8);
     assert_eq!(response.data.as_ref(), b"pong");
     responder_task.await.expect("responder finished");
+}
+
+/// A malformed binary frame is logged and skipped; the very next frame still routes.
+///
+/// Websocket frames are self-delimiting — the reader is handed whole `Binary` payloads by
+/// tungstenite and never parses a length off a byte stream itself — so a payload it cannot
+/// decode costs exactly that payload. It cannot leave a "stream position" anywhere, because
+/// there is no shared position to leave. Ending the loop on one would reinstate precisely the
+/// primitive this link exists to remove: any peer, hostile or merely version-skewed, drops the
+/// connection by sending three bytes.
+///
+/// The fixture is built for the nearest wrong implementation, which is the fatal one. Both
+/// halves are load-bearing:
+///
+/// - the frame really is undecodable (asserted, not assumed — a frame that happened to decode
+///   would make the whole test vacuous);
+/// - the observable comes AFTER the garbage and is a *correlated reply*, the one thing on this
+///   link with no fallback path. A reader that died at the garbage cannot produce it, so the
+///   assertion cannot be satisfied by a link that merely tolerated the bytes and then tore down.
+#[tokio::test]
+async fn a_malformed_frame_is_skipped_and_the_next_frame_still_routes() {
+    assert!(
+        DigMessage::from_bytes_owned(MALFORMED_FRAME.to_vec()).is_none(),
+        "the fixture decoded — this test would prove nothing about malformed frames"
+    );
+
+    let (requester, _requester_rx, mut raw) = link_with_raw_peer().await;
+
+    let peer = tokio::spawn(async move {
+        // Read the outbound request off the wire and recover the id it must be answered on.
+        let request = loop {
+            match raw
+                .next()
+                .await
+                .expect("the link sent nothing")
+                .expect("ws error")
+            {
+                tungstenite::Message::Binary(bytes) => {
+                    break DigMessage::from_bytes_owned(bytes).expect("the link framed a request")
+                }
+                _ => continue,
+            }
+        };
+
+        raw.send(tungstenite::Message::Binary(MALFORMED_FRAME.to_vec()))
+            .await
+            .expect("send the malformed frame");
+
+        raw.send(tungstenite::Message::Binary(
+            DigMessage::new(
+                DigMessageType::RespondStatus as u8,
+                request.id,
+                Bytes::new(b"pong".to_vec()),
+            )
+            .to_bytes(),
+        ))
+        .await
+        .expect("send the reply that follows the malformed frame");
+
+        // Hold the socket open: dropping it closes the link and would end the reader for a
+        // reason other than the malformed frame, muddying what the assertion below proves.
+        std::future::pending::<()>().await;
+    });
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        requester.request_dig(
+            DigMessageType::RequestStatus as u8,
+            Bytes::new(b"ping".to_vec()),
+        ),
+    )
+    .await
+    .expect("the request hung after the malformed frame")
+    .expect("the link died on a malformed frame instead of skipping it");
+
+    assert_eq!(
+        response.data.as_ref(),
+        b"pong",
+        "the frame after the malformed one was not routed"
+    );
+    peer.abort();
 }

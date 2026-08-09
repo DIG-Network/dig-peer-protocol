@@ -57,7 +57,15 @@ const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(1);
 const RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 
 /// Tunables for a single link.
+///
+/// Construct from [`Default`] and override the fields you care about
+/// (`LinkOptions { request_timeout, ..Default::default() }`). The type is `#[non_exhaustive]`
+/// because a link acquires tunables as it hardens — two arrived in one release — and this crate
+/// is released ahead of every consumer of it. Without the attribute each new tunable would be a
+/// major bump cascading through dig-gossip and everything downstream of it; with it, adding one
+/// is additive.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct LinkOptions {
     /// Scales every outbound rate-limit budget. `1.0` is the nominal Chia allowance.
     pub rate_limit_factor: f64,
@@ -402,8 +410,8 @@ fn peer_addr_of(ws: &WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Socke
 
 /// The inbound loop: decode every binary frame as a [`DigMessage`] and route it.
 ///
-/// Two deliberate differences from `chia_sdk_client`'s loop, both of which are the reason a DIG
-/// transport could not use it:
+/// Three deliberate differences from `chia_sdk_client`'s loop, all of which are the reason a DIG
+/// transport could not use it. Each removes one way for a single frame to kill a whole link:
 ///
 /// 1. **Decoding never depends on the opcode being known.** `DigMessage::from_bytes` accepts any
 ///    `u8`, so an inbound DIG opcode is a normal message rather than a fatal decode error.
@@ -413,6 +421,14 @@ fn peer_addr_of(ws: &WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Socke
 ///    collides with one of our outstanding request ids; and a hostile peer could drop the link at
 ///    will by sending one unknown id. Here, anything not matching a live waiter goes to the
 ///    application, which is where an inbound request belongs anyway.
+/// 3. **A frame that does not decode is skipped, not fatal.** Websocket frames are
+///    self-delimiting: tungstenite hands this loop whole `Binary` payloads, and the loop never
+///    reads a length off a byte stream itself. So an undecodable payload costs exactly that
+///    payload — there is no shared stream position for it to corrupt, and the frames after it
+///    decode normally. Ending the loop instead would restore the same one-frame kill switch that
+///    difference 2 exists to remove, and would do it *silently*: the reader stops, but every
+///    outstanding request stays parked in the [`RequestMap`] until its own deadline expires, so
+///    the caller sees an unexplained stall rather than a dropped connection.
 ///
 /// ## Why unmatched frames are dropped rather than queued
 ///
@@ -437,8 +453,8 @@ async fn read_inbound(
             Text(text) => warn!("dig link received an unexpected text frame: {text}"),
             Binary(binary) => {
                 let Some(message) = DigMessage::from_bytes_owned(binary) else {
-                    warn!("dig link received a malformed frame");
-                    return Err(LinkError::MalformedFrame);
+                    warn!("dig link skipped a malformed frame");
+                    continue;
                 };
 
                 let unmatched = match message.id {
