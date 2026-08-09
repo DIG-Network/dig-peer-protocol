@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.3.0] - 2026-08-09
+
+### Features
+- **link:** DIG-owned websocket peer link framing DigMessage (#5)
+
 ## [0.2.1] - 2026-07-21
 
 ### Refactor
