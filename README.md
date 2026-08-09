@@ -1,6 +1,6 @@
 # dig-peer-protocol
 
-DIG Network L2 protocol types — superset of [`chia-protocol`](https://crates.io/crates/chia-protocol) with extension opcodes **200–219**.
+DIG Network L2 protocol types — superset of [`chia-protocol`](https://crates.io/crates/chia-protocol) with extension opcodes **200–222** — plus `DigLink`, the websocket peer link that can actually carry them.
 
 One dependency replaces five: `chia-protocol`, `chia-sdk-client`, `chia-ssl`, `chia-traits`, `chia_streamable_macro` — all re-exported verbatim.
 
@@ -10,7 +10,7 @@ One dependency replaces five: `chia-protocol`, `chia-sdk-client`, `chia-ssl`, `c
 
 ```toml
 [dependencies]
-dig-peer-protocol = { version = "0.2", features = ["rustls"] }
+dig-peer-protocol = { version = "0.3", features = ["rustls"] }
 ```
 
 ### Features
@@ -28,7 +28,22 @@ Neither default. Without a TLS feature: DIG types and `Peer` still compile; `Cli
 
 `chia_protocol::Message` stores `msg_type` as `ProtocolMessageTypes` — a closed `#[repr(u8)]` enum covering opcodes 0–107. `Message::from_bytes` **rejects any unknown opcode**. DIG extension opcodes (200+) cannot decode through stock `Message`.
 
-`DigMessage` has identical wire layout but stores `msg_type` as raw `u8`. Encodes/decodes any opcode (Chia or DIG) without touching upstream types. Conversions to/from `Message` are lossless for opcodes the Chia enum recognizes.
+`DigMessage` has identical wire layout but stores `msg_type` as raw `u8`. Encodes/decodes any opcode (Chia or DIG) without touching upstream types. Conversions to/from `Message` are lossless for opcodes the Chia enum recognizes. The byte-identity is asserted exhaustively — over every opcode `chia-protocol` accepts — in `tests/wire_compatibility.rs`.
+
+The same closed enum breaks the *transport*, not just the type: `chia_sdk_client::Peer` decodes inbound frames with `Message::from_bytes`, so one DIG frame ends its receive loop and drops the connection. `DigLink` is the replacement — a websocket link written against the wire format that frames `DigMessage`.
+
+```rust,ignore
+use dig_peer_protocol::{DigLink, LinkOptions, DIG_MESSAGE};
+
+let (link, mut inbound) = DigLink::connect(addr, connector, LinkOptions::default()).await?;
+link.send_dig(DIG_MESSAGE, envelope_bytes.into()).await?;
+
+while let Some(message) = inbound.recv().await {
+    // message.msg_type is a raw u8 — Chia opcode or DIG opcode, both arrive.
+}
+```
+
+DIG previously carried vendored forks of `chia-protocol` and `chia-sdk-client` to get this. `DigLink` replaces them, so `chia-protocol` is an ordinary dependency again with no `[patch.crates-io]`.
 
 ---
 

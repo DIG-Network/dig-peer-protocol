@@ -1,6 +1,6 @@
 [package]
 name = "dig-peer-protocol"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Michael Taylor <michael@berkeleycompute.com>"]
 description = "DIG Network L2 protocol types extending Chia's wire protocol (opcodes 200+)"
@@ -17,18 +17,33 @@ chia-traits = "0.26"
 chia_streamable_macro = "0.26"
 chia-sha2 = "0.26"
 chia-ssl = "0.26"
+# LOCKSTEP: chia-sdk-client and chia-protocol must be bumped together.
+# src/rate_limit.rs re-keys V2_RATE_LIMITS through chia_protocol::ProtocolMessageTypes —
+# the derived opcode bytes are correct only while sdk-client's RateLimits is keyed by the
+# same ProtocolMessageTypes type imported from chia-protocol 0.26.  Bumping either crate
+# alone can silently shift the derived opcode bytes without a compile error.
 chia-sdk-client = { version = "0.28", default-features = false }
 
 # Serialization for DigMessageType
 serde = { version = "1", features = ["derive"] }
 
+# Peer link — websocket transport for DigMessage framing. Versions match chia-sdk-client's so a
+# `Connector` obtained through either crate is the same type.
+futures-util = "0.3.30"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt", "net", "macros"] }
+tokio-tungstenite = "0.24"
+tungstenite = "0.24"
+tracing = "0.1"
+
 [dev-dependencies]
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
 
 [features]
 # TLS backend forwarding — consumers enable these on dig-peer-protocol instead of chia-sdk-client.
-native-tls = ["chia-sdk-client/native-tls"]
-rustls = ["chia-sdk-client/rustls"]
+native-tls = ["chia-sdk-client/native-tls", "tokio-tungstenite/native-tls"]
+rustls = ["chia-sdk-client/rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
 
 [lints.rust]
 unsafe_code = "deny"
