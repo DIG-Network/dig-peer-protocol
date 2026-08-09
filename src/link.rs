@@ -58,12 +58,22 @@ const RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 
 /// Tunables for a single link.
 ///
-/// Construct from [`Default`] and override the fields you care about
-/// (`LinkOptions { request_timeout, ..Default::default() }`). The type is `#[non_exhaustive]`
-/// because a link acquires tunables as it hardens — two arrived in one release — and this crate
-/// is released ahead of every consumer of it. Without the attribute each new tunable would be a
-/// major bump cascading through dig-gossip and everything downstream of it; with it, adding one
-/// is additive.
+/// The type is `#[non_exhaustive]` because a link acquires tunables as it hardens — two arrived
+/// in one release — and this crate is released ahead of every consumer of it. Without the
+/// attribute each new tunable would be a major bump cascading through dig-gossip and everything
+/// downstream of it; with it, adding one is additive.
+///
+/// The cost is that consumers cannot name the type in a struct expression at all — not even with
+/// `..Default::default()`, which Rust also forbids for a `#[non_exhaustive]` struct. Start from
+/// [`Default`] and assign the fields you care about:
+///
+/// ```
+/// use std::time::Duration;
+/// use dig_peer_protocol::LinkOptions;
+///
+/// let mut options = LinkOptions::default();
+/// options.request_timeout = Duration::from_secs(5);
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct LinkOptions {
