@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use chia_protocol::Bytes;
+use dig_peer_protocol::Bytes;
 use dig_peer_protocol::{DigLink, DigMessage, LinkOptions, HOLDINGS_ANNOUNCE};
 use tokio::io::DuplexStream;
 use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};

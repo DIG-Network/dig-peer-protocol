@@ -1,31 +1,46 @@
-//! [`DigMessage`] — wire-compatible `Message` with raw `u8` opcode support.
+//! [`DigMessage`] — the native DIG peer envelope, with a raw `u8` opcode.
 //!
-//! ## Problem
+//! ## The problem it exists to solve
 //!
-//! `chia_protocol::Message` stores `msg_type` as `ProtocolMessageTypes` (a closed `#[repr(u8)]`
-//! enum). `Message::from_bytes` rejects any opcode not in that enum, which means DIG extension
-//! opcodes (200–219) cannot be decoded without patching the upstream crate.
+//! `chia_protocol::Message` stores `msg_type` as `ProtocolMessageTypes`, a closed `#[repr(u8)]`
+//! enum with no `Unknown(u8)` variant. `Message::from_bytes` rejects any opcode outside it, so a
+//! DIG opcode could not be encoded or decoded through that type without forking the upstream
+//! crate — which is exactly what DIG used to do.
 //!
-//! ## Solution
+//! ## The native envelope
 //!
-//! `DigMessage` uses the same wire layout (`u8 + Option<u16> + Bytes`) but stores `msg_type`
-//! as a plain `u8`. This allows encoding and decoding any opcode — Chia or DIG — without
-//! modifying upstream types. Conversion to/from `chia_protocol::Message` is provided for
-//! opcodes that the Chia enum recognizes.
+//! `DigMessage` owns its encoding outright: [`to_bytes`](DigMessage::to_bytes) and
+//! [`from_bytes`](DigMessage::from_bytes) write and read the wire directly, with no upstream
+//! type participating. It is DIG's envelope for every DIG opcode, and it can express a chia-band
+//! opcode identically because the layout is the same one chia peers already speak.
+//!
+//! ```text
+//! [u8 msg_type] [u8 has_id (0/1)] [u16 id (big-endian, if has_id)] [u32 data_len (big-endian)] [data...]
+//! ```
+//!
+//! ## No bridge to `chia_protocol::Message`
+//!
+//! There is deliberately no conversion to or from `chia_protocol::Message`. Earlier revisions
+//! carried four such helpers, and they were the on-ramp back onto the forked route: a consumer
+//! that could cheaply obtain a `Message` kept building one, and the closed enum came back with
+//! it. Chia-band traffic to chia peers goes through
+//! [`DigLink`](crate::DigLink)'s typed `send`/`request`, which derive their opcode from
+//! `ChiaProtocolMessage` — that is the supported chia path, and the only one.
 
-use chia_protocol::{Bytes, Message, ProtocolMessageTypes};
-use chia_traits::Streamable;
+use crate::Bytes;
 
-/// Wire message with raw `u8` opcode — handles both Chia (0–107) and DIG (200–219) opcodes.
+/// The DIG peer envelope: a raw `u8` opcode, an optional correlation id, and a payload.
 ///
-/// Same binary layout as `chia_protocol::Message`:
+/// Expresses any opcode, DIG-band or chia-band, because the opcode is a plain byte with no enum
+/// standing between it and the wire.
+///
 /// ```text
-/// [u8 msg_type] [bool has_id] [u16 id (if has_id)] [u32 data_len] [u8... data]
+/// [u8 msg_type] [u8 has_id] [u16 id (if has_id)] [u32 data_len] [u8... data]
 /// ```
 ///
-/// Use [`DigMessage::to_bytes`] / [`DigMessage::from_bytes`] for wire serialization.
-/// Use [`DigMessage::try_into_chia_message`] to convert to stock `Message` when the opcode
-/// is a known Chia type.
+/// The encoding is pinned as absolute hex in `tests/golden_wire_vectors.rs`. It is a live
+/// network's wire format: a change to these bytes is a coordinated network event, never a
+/// refactor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DigMessage {
     /// Raw wire opcode — no enum restriction.
@@ -200,59 +215,6 @@ impl DigMessage {
         })
     }
 
-    /// Convert from a stock `chia_protocol::Message` (lossless — opcode stored as u8).
-    ///
-    /// Clones `msg.data`. Prefer [`Self::from_chia_message_owned`] when an owned
-    /// `Message` is available and does not need to be kept afterward.
-    pub fn from_chia_message(msg: &Message) -> Self {
-        Self {
-            msg_type: msg.msg_type as u8,
-            id: msg.id,
-            data: msg.data.clone(),
-        }
-    }
-
-    /// Convert from an OWNED stock `chia_protocol::Message`, moving `data` instead of
-    /// cloning it (lossless — opcode stored as u8).
-    pub fn from_chia_message_owned(msg: Message) -> Self {
-        Self {
-            msg_type: msg.msg_type as u8,
-            id: msg.id,
-            data: msg.data,
-        }
-    }
-
-    /// Try to convert to a stock `chia_protocol::Message`, cloning `self.data`.
-    ///
-    /// Fails if `msg_type` is not a valid `ProtocolMessageTypes` discriminant
-    /// (i.e., DIG extension opcodes 200+ will fail here — use `DigMessage` directly
-    /// for those). Prefer [`Self::into_chia_message`] when `self` does not need to be
-    /// kept afterward.
-    pub fn try_into_chia_message(&self) -> Option<Message> {
-        // ProtocolMessageTypes implements Streamable; from_bytes on a single u8
-        let pmt = ProtocolMessageTypes::from_bytes(&[self.msg_type]).ok()?;
-        Some(Message {
-            msg_type: pmt,
-            id: self.id,
-            data: self.data.clone(),
-        })
-    }
-
-    /// Try to convert into a stock `chia_protocol::Message` BY VALUE, moving `self.data`
-    /// instead of cloning it.
-    ///
-    /// Same failure condition as [`Self::try_into_chia_message`]: `None` when `msg_type`
-    /// is not a valid `ProtocolMessageTypes` discriminant. On failure `self` is dropped
-    /// (its opcode was not a known Chia type, so there is nothing useful to hand back).
-    pub fn into_chia_message(self) -> Option<Message> {
-        let pmt = ProtocolMessageTypes::from_bytes(&[self.msg_type]).ok()?;
-        Some(Message {
-            msg_type: pmt,
-            id: self.id,
-            data: self.data,
-        })
-    }
-
     /// Whether this message carries a DIG extension opcode (>= 200).
     pub fn is_dig_extension(&self) -> bool {
         self.msg_type >= 200
@@ -324,62 +286,6 @@ mod tests {
         wire.extend_from_slice(&[0xEE, 0xFF]); // trailing garbage
         let decoded = DigMessage::from_bytes_owned(wire).expect("decode");
         assert_eq!(decoded.data.as_ref(), &[0xAB, 0xCD]);
-    }
-
-    #[test]
-    fn into_chia_message_moves_data_without_cloning() {
-        // into_chia_message consumes self by value; the resulting Message's data must
-        // equal what try_into_chia_message (the cloning, borrowing variant) would have
-        // produced, proving the by-value path is behaviourally identical.
-        let dig = DigMessage::new(20, Some(3), Bytes::new(vec![1, 2, 3, 4]));
-        let expected_data = dig.data.clone();
-        let msg = dig.into_chia_message().expect("known opcode");
-        assert_eq!(msg.msg_type, ProtocolMessageTypes::NewPeak);
-        assert_eq!(msg.id, Some(3));
-        assert_eq!(msg.data, expected_data);
-    }
-
-    #[test]
-    fn into_chia_message_rejects_unknown_opcode() {
-        let dig = DigMessage::new(250, None, Bytes::default());
-        assert!(dig.into_chia_message().is_none());
-    }
-
-    #[test]
-    fn from_chia_message_owned_moves_data_without_cloning() {
-        let chia_msg = Message {
-            msg_type: ProtocolMessageTypes::NewPeak,
-            id: Some(11),
-            data: Bytes::new(vec![7, 7, 7]),
-        };
-        let expected_data = chia_msg.data.clone();
-        let dig = DigMessage::from_chia_message_owned(chia_msg);
-        assert_eq!(dig.msg_type, 20);
-        assert_eq!(dig.id, Some(11));
-        assert_eq!(dig.data, expected_data);
-    }
-
-    #[test]
-    fn from_chia_message() {
-        let chia_msg = Message {
-            msg_type: ProtocolMessageTypes::NewPeak,
-            id: Some(7),
-            data: Bytes::new(vec![0xFF]),
-        };
-        let dig = DigMessage::from_chia_message(&chia_msg);
-        assert_eq!(dig.msg_type, 20); // NewPeak = 20
-        assert_eq!(dig.id, Some(7));
-
-        // Round-trip back to Chia
-        let back = dig.try_into_chia_message().expect("known opcode");
-        assert_eq!(back.msg_type, ProtocolMessageTypes::NewPeak);
-    }
-
-    #[test]
-    fn unknown_opcode_cannot_convert_to_chia_message() {
-        // Use an opcode that is NOT in ProtocolMessageTypes (neither Chia nor vendored DIG).
-        let dig = DigMessage::new(250, None, Bytes::default());
-        assert!(dig.try_into_chia_message().is_none());
     }
 
     #[test]
@@ -495,20 +401,6 @@ mod tests {
         let decoded = DigMessage::from_bytes(&wire).expect("zero-length decode");
         assert_eq!(decoded, msg);
         assert!(decoded.data.as_ref().is_empty());
-    }
-
-    #[test]
-    fn from_chia_message_preserves_no_id() {
-        // Exercise the id == None branch of from_chia_message + the boundary opcode 199/200.
-        let chia_msg = Message {
-            msg_type: ProtocolMessageTypes::Handshake,
-            id: None,
-            data: Bytes::default(),
-        };
-        let dig = DigMessage::from_chia_message(&chia_msg);
-        assert_eq!(dig.id, None);
-        assert!(dig.is_chia_standard());
-        assert!(!dig.is_dig_extension());
     }
 
     #[test]

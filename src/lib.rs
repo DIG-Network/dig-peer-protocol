@@ -1,37 +1,45 @@
 //! # dig-peer-protocol
 //!
-//! DIG Network L2 protocol types — a superset of `chia-protocol`.
+//! The DIG Network peer wire — a **native** protocol, plus the narrow chia surface a DIG node
+//! needs to also speak to chia full nodes.
 //!
-//! This crate re-exports the entire Chia protocol ecosystem (`chia-protocol`,
-//! `chia-sdk-client`, `chia-ssl`, `chia-traits`) plus DIG's own extensions: the
-//! `200..=222` opcode band, the [`DigMessage`] framing that can express it, and
-//! [`DigLink`], the websocket peer link that carries it. Consumers depend on
-//! `dig-peer-protocol` alone instead of importing multiple `chia-*` crates individually.
+//! ## The native DIG wire
 //!
-//! ## The closed-enum problem, and how this crate closes it
+//! [`DigMessage`] is the envelope for every DIG message: a raw `u8` opcode, an optional
+//! correlation id, and a [`Bytes`] payload, encoded by this crate and nothing else. It carries
+//! the `200..=222` DIG opcode band, which `chia_protocol::Message` structurally cannot express —
+//! its `ProtocolMessageTypes` is a closed `#[repr(u8)]` enum with no `Unknown(u8)`, so a DIG
+//! opcode is neither constructible nor decodable through it, and one inbound DIG frame drops a
+//! whole `chia-sdk-client` connection rather than that one frame.
 //!
-//! `chia_protocol::Message` stores its opcode as `ProtocolMessageTypes`, an enum that stops
-//! at `RespondCostInfo = 107` with no `Unknown(u8)`. A DIG opcode has no value in that enum, so
-//! it is neither constructible nor decodable through it — and worse, `chia-sdk-client`'s
-//! receive loop calls `Message::from_bytes`, so one inbound DIG frame drops the whole
-//! connection rather than that one frame.
+//! DIG answered that with vendored forks of `chia-protocol` and `chia-sdk-client`. This crate
+//! replaces the forks: [`DigLink`] is a websocket peer link written directly against the wire
+//! format, and the DIG types it carries — [`Bytes`], [`NodeType`], [`DigMessage`],
+//! [`DigMessageType`], [`RegisterPeer`], [`RegisterAck`] — are DIG's own.
 //!
-//! [`DigMessage`] answers the first half: the same wire bytes with a raw `u8` opcode.
-//! [`DigLink`] answers the second: a websocket link that frames `DigMessage` end to end.
-//! Together they replace the vendored `chia-protocol` / `chia-sdk-client` forks DIG used to
-//! carry, so `chia-protocol` is an ordinary dependency with no `[patch.crates-io]`.
+//! ## What is deliberately still chia, and why
 //!
-//! ## What's included
+//! Decoupling from `chia-protocol` is not the same as decoupling from every crate whose name
+//! starts with `chia`. Two are kept ON PURPOSE. **Do not "finish the decoupling" by removing
+//! them** — they were assessed and retained:
 //!
-//! | Source crate | What's re-exported |
-//! |-------------|-------------------|
-//! | `chia-protocol` | All wire types: `Message`, `Handshake`, `ProtocolMessageTypes`, `NodeType`, etc. |
-//! | `chia-sdk-client` | `Peer`, `Client`, `ClientError`, `ClientState`, `Network`, `PeerOptions`, rate limiting, TLS connectors |
-//! | `chia-ssl` | `ChiaCertificate` |
-//! | `chia-traits` | `Streamable` trait |
-//! | `chia_streamable_macro` | `#[streamable]` proc macro |
-//! | **DIG extensions** | `DigMessage`, `DigMessageType`, the `200..=222` opcode band, `RegisterPeer`, `RegisterAck`, introducer wire types |
-//! | **DIG peer link** | `DigLink`, `LinkOptions`, `LinkError`, `Admission`, `OpcodeRateLimiter`, `OpcodeRateLimits` |
+//! - **`chia-traits` ([`Streamable`]) and `chia_streamable_macro` ([`macro@streamable`])** — a
+//!   serialization trait and a derive macro. Neither has the property this crate is escaping:
+//!   there is no closed enum and no private-field wire authority in either. They serialize the
+//!   *bodies* of DIG messages, and they do it with an encoding that is already live on the
+//!   network. Replacing them would mean owning a serializer — new surface, and a fresh
+//!   byte-identity risk — to buy nothing that matters.
+//! - **`chia-protocol`'s `ChiaProtocolMessage` and `TimestampedPeerInfo`, and
+//!   `chia-sdk-client`** — these serve genuine *chia* traffic. A DIG node talks to chia full
+//!   nodes too: [`DigLink`]'s typed `send`/`request` derive a chia opcode from
+//!   `ChiaProtocolMessage`, [`RespondPeersIntroducer`] is chia opcode 64, and
+//!   [`OpcodeRateLimits`] re-keys chia's own published rate-limit table so a chia opcode is
+//!   limited exactly as a stock peer would limit it. Chia types for chia traffic is the design,
+//!   not a leftover.
+//!
+//! There is no blanket `pub use chia_protocol::*`. A glob re-export is how chia types reach
+//! consumers that never asked for them, and it made a chia version bump a breaking change to
+//! every downstream crate. What a chia-full-node path needs is named explicitly below.
 //!
 //! ## Feature flags
 //!
@@ -40,15 +48,17 @@
 //! | `native-tls` | `chia-sdk-client/native-tls` | OS-native TLS; enables `Client`, `ClientState`, `Connector`, `create_native_tls_connector`, `DigLink::connect` |
 //! | `rustls` | `chia-sdk-client/rustls` | Pure-Rust TLS; enables `Client`, `ClientState`, `Connector`, `create_rustls_connector`, `DigLink::connect` |
 //!
-//! Neither feature is enabled by default. The crate builds without either but TLS-dependent
-//! items (`Client`, `ClientState`, `Connector`, and `DigLink::connect`) become unavailable;
+//! Neither is enabled by default. Without one, the TLS-dependent items above are unavailable;
 //! [`DigLink::from_websocket`] and [`DigLink::from_server_websocket`] stay available, since
 //! adopting an already-established socket needs no TLS backend of its own.
 
 // ============================================================================
-// Re-export: chia-protocol (all wire types)
+// Re-export: chia-protocol — NAMED, for chia-full-node paths only
 // ============================================================================
-pub use chia_protocol::*;
+// Explicitly not a glob. `ChiaProtocolMessage` is what `DigLink`'s typed send/request bound
+// their generics on, and `TimestampedPeerInfo` is a field of chia opcode 64; a consumer needing
+// any other chia wire type depends on `chia-protocol` directly and says so in its own manifest.
+pub use chia_protocol::{ChiaProtocolMessage, ProtocolMessageTypes, TimestampedPeerInfo};
 
 // ============================================================================
 // Re-export: chia-sdk-client (peer IO, TLS, rate limiting)
@@ -88,15 +98,18 @@ pub use chia_streamable_macro::streamable;
 // ============================================================================
 // DIG extensions
 // ============================================================================
+mod bytes;
 mod dig_message;
 mod dig_message_type;
 mod error;
 mod introducer_wire;
 mod link;
+mod node_type;
 mod opcodes;
 mod rate_limit;
 mod request_map;
 
+pub use bytes::Bytes;
 pub use dig_message::DigMessage;
 pub use dig_message_type::{DigMessageType, UnknownDigMessageType};
 pub use error::LinkError;
@@ -104,6 +117,7 @@ pub use introducer_wire::{
     RegisterAck, RegisterPeer, RequestPeersIntroducer, RespondPeersIntroducer,
 };
 pub use link::{DigLink, LinkOptions};
+pub use node_type::{NodeType, UnknownNodeType};
 pub use opcodes::{
     is_dig_opcode, ALL_DIG_OPCODES, DIG_BAND_START, DIG_MESSAGE, FREE_BAND_START,
     HOLDINGS_ANNOUNCE, STORE_MELTED,

@@ -216,8 +216,8 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{Admission, OpcodeRateLimiter, OpcodeRateLimits};
-    use crate::{DigMessage, DIG_MESSAGE};
-    use chia_protocol::{Bytes, ProtocolMessageTypes};
+    use crate::{Bytes, DigMessage, DIG_MESSAGE};
+    use chia_protocol::ProtocolMessageTypes;
     use chia_traits::Streamable;
 
     fn message(opcode: u8, payload_len: usize) -> DigMessage {

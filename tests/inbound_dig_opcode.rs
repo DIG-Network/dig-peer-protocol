@@ -12,8 +12,9 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use chia_protocol::{Bytes, Message, ProtocolMessageTypes};
+use chia_protocol::{Message, ProtocolMessageTypes};
 use chia_traits::Streamable;
+use dig_peer_protocol::Bytes;
 use dig_peer_protocol::{DigLink, DigMessage, DigMessageType, LinkOptions};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::DuplexStream;

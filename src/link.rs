@@ -27,7 +27,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use chia_protocol::{Bytes, ChiaProtocolMessage};
+use chia_protocol::ChiaProtocolMessage;
 use chia_traits::Streamable;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
@@ -41,7 +41,7 @@ use tracing::{debug, warn};
 use crate::{
     rate_limit::{Admission, OpcodeRateLimiter, OpcodeRateLimits},
     request_map::RequestMap,
-    DigMessage, LinkError,
+    Bytes, DigMessage, LinkError,
 };
 
 #[cfg(any(feature = "native-tls", feature = "rustls"))]

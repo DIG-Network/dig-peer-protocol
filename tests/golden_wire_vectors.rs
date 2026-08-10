@@ -35,10 +35,11 @@
 //! | `NodeType` | `FullNode` **and** `Introducer` | a hard-coded discriminant |
 //! | `String` field | non-empty, non-ASCII-boundary length | a missing or narrow length prefix |
 
-use chia_protocol::{Bytes, NodeType, TimestampedPeerInfo};
+use chia_protocol::TimestampedPeerInfo;
 use chia_traits::Streamable;
 use dig_peer_protocol::{
-    DigMessage, RegisterAck, RegisterPeer, RequestPeersIntroducer, RespondPeersIntroducer,
+    Bytes, DigMessage, NodeType, RegisterAck, RegisterPeer, RequestPeersIntroducer,
+    RespondPeersIntroducer,
 };
 
 /// Render bytes as lowercase hex so a failure prints a diffable value rather than a `Vec` dump.

@@ -15,7 +15,7 @@
 //! | `id` | `None`, and `Some(0x0102)` — asymmetric, so BE ≠ LE | a little-endian id, or a wrong `Option` tag |
 //! | payload len | 0, 1, 300, 65_600 | a `u8` (>255) or `u16` (>65_535) length prefix masquerading as `u32` |
 
-use chia_protocol::{Bytes, Message, ProtocolMessageTypes};
+use chia_protocol::{Message, ProtocolMessageTypes};
 use chia_traits::Streamable;
 use dig_peer_protocol::DigMessage;
 
@@ -56,9 +56,9 @@ fn dig_message_encodes_byte_identically_to_chia_message() {
                 let chia = Message {
                     msg_type: chia_type,
                     id,
-                    data: Bytes::new(payload.clone()),
+                    data: chia_protocol::Bytes::new(payload.clone()),
                 };
-                let dig = DigMessage::new(opcode, id, Bytes::new(payload));
+                let dig = DigMessage::new(opcode, id, dig_peer_protocol::Bytes::new(payload));
 
                 assert_eq!(
                     dig.to_bytes(),
@@ -81,7 +81,7 @@ fn dig_message_decodes_what_chia_message_encoded() {
                 let wire = Message {
                     msg_type: chia_type,
                     id,
-                    data: Bytes::new(payload.clone()),
+                    data: chia_protocol::Bytes::new(payload.clone()),
                 }
                 .to_bytes()
                 .expect("chia encode");
