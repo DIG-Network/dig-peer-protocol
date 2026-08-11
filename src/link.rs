@@ -316,18 +316,33 @@ impl DigLink {
         Ok(())
     }
 
-    /// Send a Chia-typed body and await the correlated reply, unparsed.
-    pub async fn request_raw<T>(&self, body: T) -> Result<DigMessage, LinkError>
+    /// Send a Chia-typed body and await the correlated reply of type `R`, unparsed.
+    ///
+    /// `R` names the reply that completes the request. It is required rather than inferred
+    /// because a correlation id alone cannot identify a reply: both peers allocate ids from their
+    /// own counter, so the peer's *request* can carry an id we are waiting on. See
+    /// [`RequestMap::take_matching`](crate::request_map::RequestMap::take_matching).
+    pub async fn request_raw<R, B>(&self, body: B) -> Result<DigMessage, LinkError>
     where
-        T: Streamable + ChiaProtocolMessage,
+        R: ChiaProtocolMessage,
+        B: Streamable + ChiaProtocolMessage,
     {
-        self.request_message(opcode_of::<T>()?, body.to_bytes()?.into())
+        self.request_message(opcode_of::<B>()?, body.to_bytes()?.into(), vec![opcode_of::<R>()?])
             .await
     }
 
-    /// Send a DIG-band body and await the correlated reply, unparsed.
-    pub async fn request_dig(&self, opcode: u8, data: Bytes) -> Result<DigMessage, LinkError> {
-        self.request_message(opcode, data).await
+    /// Send a DIG-band body and await a correlated reply carrying one of `expected`, unparsed.
+    ///
+    /// The reply opcodes are the caller's to state: the link deliberately knows nothing about
+    /// which DIG opcode answers which, and guessing would put protocol semantics into a
+    /// transport. Listing more than one accommodates a protocol with an accept/reject pair.
+    pub async fn request_dig(
+        &self,
+        opcode: u8,
+        expected: &[u8],
+        data: Bytes,
+    ) -> Result<DigMessage, LinkError> {
+        self.request_message(opcode, data, expected.to_vec()).await
     }
 
     /// Send a Chia-typed body and await a reply of exactly one expected type.
@@ -337,7 +352,9 @@ impl DigLink {
         B: Streamable + ChiaProtocolMessage,
     {
         let expected = opcode_of::<T>()?;
-        let message = self.request_raw(body).await?;
+        let message = self
+            .request_message(opcode_of::<B>()?, body.to_bytes()?.into(), vec![expected])
+            .await?;
         if message.msg_type != expected {
             return Err(LinkError::InvalidResponse(vec![expected], message.msg_type));
         }
@@ -352,7 +369,13 @@ impl DigLink {
         B: Streamable + ChiaProtocolMessage,
     {
         let (accepted, rejected) = (opcode_of::<T>()?, opcode_of::<E>()?);
-        let message = self.request_raw(body).await?;
+        let message = self
+            .request_message(
+                opcode_of::<B>()?,
+                body.to_bytes()?.into(),
+                vec![accepted, rejected],
+            )
+            .await?;
 
         if message.msg_type == accepted {
             Ok(Ok(T::from_bytes(&message.data)?))
@@ -371,22 +394,27 @@ impl DigLink {
     /// The wait is bounded by [`LinkOptions::request_timeout`]. On expiry the id is reclaimed
     /// immediately rather than left occupying the map until the link drops — an unbounded wait
     /// against a silent peer leaks ids as well as hanging the caller.
-    async fn request_message(&self, opcode: u8, data: Bytes) -> Result<DigMessage, LinkError> {
+    async fn request_message(
+        &self,
+        opcode: u8,
+        data: Bytes,
+        expected: Vec<u8>,
+    ) -> Result<DigMessage, LinkError> {
         let (sender, receiver) = oneshot::channel();
-        let id = self.0.requests.insert(sender).await;
+        let id = self.0.requests.insert(sender, expected).await;
 
         if let Err(error) = self
             .send_message(DigMessage::new(opcode, Some(id), data))
             .await
         {
-            self.0.requests.remove(id).await;
+            self.0.requests.cancel(id).await;
             return Err(error);
         }
 
         match tokio::time::timeout(self.0.options.request_timeout, receiver).await {
             Ok(received) => Ok(received?),
             Err(_) => {
-                self.0.requests.remove(id).await;
+                self.0.requests.cancel(id).await;
                 Err(LinkError::RequestTimeout(opcode))
             }
         }
@@ -471,7 +499,7 @@ async fn read_inbound(
                 };
 
                 let unmatched = match message.id {
-                    Some(id) => match requests.remove(id).await {
+                    Some(id) => match requests.cancel(id).await {
                         Some(waiter) => {
                             waiter.send(message);
                             continue;

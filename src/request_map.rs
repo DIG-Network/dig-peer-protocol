@@ -13,6 +13,15 @@ use crate::DigMessage;
 #[derive(Debug)]
 pub(crate) struct Request {
     sender: oneshot::Sender<DigMessage>,
+    /// The opcodes that can complete this waiter.
+    ///
+    /// Correlation ids are chosen independently by each side and both start at 0, so a peer's
+    /// own *request* routinely carries an id we are waiting on. Matching on the id ALONE would
+    /// hand that request to this waiter, which then fails to parse it as a response while the
+    /// application never sees the request at all — and both ends time each other out. Recording
+    /// what a waiter is waiting FOR makes that misdelivery unexpressible, without teaching the
+    /// link any protocol semantics.
+    expected: Vec<u8>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -47,7 +56,10 @@ impl RequestMap {
     }
 
     /// Reserve an unused correlation id for `sender`, waiting if the id space is saturated.
-    pub(crate) async fn insert(&self, sender: oneshot::Sender<DigMessage>) -> u16 {
+    ///
+    /// `expected` lists the opcodes that may complete the waiter; any other frame carrying this
+    /// id belongs to the application (see [`Self::take_matching`]).
+    pub(crate) async fn insert(&self, sender: oneshot::Sender<DigMessage>, expected: Vec<u8>) -> u16 {
         let permit = self
             .capacity
             .clone()
@@ -78,14 +90,29 @@ impl RequestMap {
             id,
             Request {
                 sender,
+                expected,
                 _permit: permit,
             },
         );
         id
     }
 
-    /// Take the waiter for `id`, if one is still live.
-    pub(crate) async fn remove(&self, id: u16) -> Option<Request> {
+    /// Take the waiter for `id` **only if** `msg_type` is a reply it is waiting for.
+    ///
+    /// A frame that carries a live id but a different opcode is not this waiter's reply — it is
+    /// the peer's own request, which merely allocated the same id — so it is left for the
+    /// application and the waiter stays parked for its real answer.
+    pub(crate) async fn take_matching(&self, id: u16, msg_type: u8) -> Option<Request> {
+        let mut items = self.items.lock().await;
+        if !items.get(&id)?.expected.contains(&msg_type) {
+            return None;
+        }
+        items.remove(&id)
+    }
+
+    /// Take the waiter for `id` whatever it was waiting for — used to reclaim an id when the
+    /// request itself is abandoned (a failed send, an expired deadline).
+    pub(crate) async fn cancel(&self, id: u16) -> Option<Request> {
         self.items.lock().await.remove(&id)
     }
 }

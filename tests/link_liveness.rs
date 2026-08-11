@@ -116,7 +116,7 @@ async fn a_flood_of_unmatched_ids_cannot_wedge_the_correlated_reply_path() {
 
     let response = tokio::time::timeout(
         PATIENCE,
-        requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"ping".to_vec())),
+        requester.request_dig(HOLDINGS_ANNOUNCE, &[HOLDINGS_ANNOUNCE], Bytes::new(b"ping".to_vec())),
     )
     .await
     .expect("the flood wedged the reader: no correlated reply was ever routed")
@@ -138,7 +138,7 @@ async fn an_unanswered_request_errors_on_its_deadline() {
 
     let outcome = tokio::time::timeout(
         PATIENCE,
-        requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"ping".to_vec())),
+        requester.request_dig(HOLDINGS_ANNOUNCE, &[HOLDINGS_ANNOUNCE], Bytes::new(b"ping".to_vec())),
     )
     .await
     .expect("the request hung past its deadline");
@@ -172,7 +172,7 @@ async fn a_late_reply_to_a_timed_out_request_is_not_misrouted_to_the_next_waiter
         // The peer_rx will deliver the message regardless.
         let _ = tokio::time::timeout(
             PATIENCE,
-            requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"question-A".to_vec())),
+            requester.request_dig(HOLDINGS_ANNOUNCE, &[HOLDINGS_ANNOUNCE], Bytes::new(b"question-A".to_vec())),
         )
         .await
         .expect("request A should have timed out, not hung");
@@ -204,7 +204,7 @@ async fn a_late_reply_to_a_timed_out_request_is_not_misrouted_to_the_next_waiter
 
     let b_response = tokio::time::timeout(
         PATIENCE,
-        requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"question-B".to_vec())),
+        requester.request_dig(HOLDINGS_ANNOUNCE, &[HOLDINGS_ANNOUNCE], Bytes::new(b"question-B".to_vec())),
     )
     .await
     .expect("request B hung")
