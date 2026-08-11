@@ -43,9 +43,22 @@ pub struct OpcodeRateLimits {
     other: HashMap<u8, RateLimit>,
 }
 
-impl OpcodeRateLimits {
-    /// Re-key a Chia limit table onto raw opcodes.
-    fn from_chia(limits: &RateLimits) -> Self {
+/// Re-key any Chia limit table onto raw opcodes.
+///
+/// The numbers remain DERIVED — a caller chooses the *source table*, never the individual limits —
+/// so the drift this type exists to prevent stays prevented. A table assembled from
+/// `V2_RATE_LIMITS` (retuned, extended, or narrowed for a test) is exactly as trustworthy as the
+/// default.
+///
+/// The module header's lockstep pin applies undiminished, and a caller-supplied table is the one
+/// way to violate it from outside this crate: the keys are `chia_protocol::ProtocolMessageTypes`
+/// values streamed to their wire byte, so a table keyed by a *different* `chia_protocol` version's
+/// enum re-keys to shifted bytes, every Chia opcode misses its entry and falls to
+/// `default_settings` — a silent loosening with no compile error. Build the table with the
+/// `chia_protocol` this crate resolves; re-export it from here (`crate::RateLimits`) rather than
+/// depending on `chia-sdk-client` independently.
+impl From<&RateLimits> for OpcodeRateLimits {
+    fn from(limits: &RateLimits) -> Self {
         // `ProtocolMessageTypes` is a streamable single-byte enum, so its encoding IS its wire
         // opcode — the same identity `DigMessage` relies on.
         let rekey = |map: &HashMap<chia_protocol::ProtocolMessageTypes, RateLimit>| {
@@ -66,7 +79,7 @@ impl OpcodeRateLimits {
 
 impl Default for OpcodeRateLimits {
     fn default() -> Self {
-        Self::from_chia(&V2_RATE_LIMITS)
+        Self::from(&*V2_RATE_LIMITS)
     }
 }
 
@@ -218,10 +231,46 @@ mod tests {
     use super::{Admission, OpcodeRateLimiter, OpcodeRateLimits};
     use crate::{Bytes, DigMessage, DIG_MESSAGE};
     use chia_protocol::ProtocolMessageTypes;
+    use chia_sdk_client::{RateLimit, RateLimits, V2_RATE_LIMITS};
     use chia_traits::Streamable;
 
     fn message(opcode: u8, payload_len: usize) -> DigMessage {
         DigMessage::new(opcode, None, Bytes::new(vec![0u8; payload_len]))
+    }
+
+    /// The wire byte `Handshake` streams to — the same derivation the re-key itself performs.
+    fn handshake_opcode() -> u8 {
+        *ProtocolMessageTypes::Handshake
+            .to_bytes()
+            .expect("encode")
+            .first()
+            .expect("one byte")
+    }
+
+    /// `V2_RATE_LIMITS` with `Handshake` retuned to admit only two messages per window.
+    ///
+    /// Two is chosen because upstream's own `Handshake` frequency is 5: a limiter built from this
+    /// table refuses a third message that a limiter built from the upstream table admits, so the
+    /// two are distinguishable by observation rather than by inspecting private fields.
+    fn handshake_capped_at_two() -> RateLimits {
+        let mut limits = V2_RATE_LIMITS.clone();
+        limits.other.insert(
+            ProtocolMessageTypes::Handshake,
+            RateLimit::new(2.0, 10.0 * 1024.0, None),
+        );
+        limits
+    }
+
+    /// Admit `count` handshakes of a size no cap can refuse, returning the verdict on each.
+    ///
+    /// The payload is deliberately tiny so the per-message and cumulative SIZE budgets can never
+    /// bind: the only budget that can produce a refusal is `frequency`, which is the axis the
+    /// custom table moves.
+    fn admit_handshakes(limits: OpcodeRateLimits, count: usize) -> Vec<Admission> {
+        let mut limiter = OpcodeRateLimiter::new(60, 1.0, limits);
+        (0..count)
+            .map(|_| limiter.admit(&message(handshake_opcode(), 16)))
+            .collect()
     }
 
     /// The table is DERIVED, not copied: a Chia opcode with a specific entry upstream must have
@@ -248,6 +297,52 @@ mod tests {
 
         assert_eq!(ours.frequency, upstream.frequency);
         assert_eq!(ours.max_size, upstream.max_size);
+    }
+
+    /// A caller-supplied table governs the limiter — the CUSTOM row is honoured, not upstream's.
+    ///
+    /// The conversion is observed through behaviour rather than through the derived fields, so it
+    /// stays honest about what a consumer can actually do with it: three handshakes are offered to
+    /// a limiter whose table caps them at two, and the third must be refused. `Deferred` rather
+    /// than merely "not admitted", because a frequency exhaustion is the refusal that a window
+    /// roll clears; an `Unsendable` here would mean the size fixture, not the custom row, did the
+    /// refusing.
+    #[test]
+    fn a_caller_supplied_table_governs_the_limiter() {
+        let verdicts = admit_handshakes(OpcodeRateLimits::from(&handshake_capped_at_two()), 3);
+
+        assert_eq!(
+            verdicts,
+            vec![
+                Admission::Admitted,
+                Admission::Admitted,
+                Admission::Deferred
+            ],
+            "the custom frequency of 2 did not govern"
+        );
+    }
+
+    /// `Default` is unchanged by the delegation: it still derives from `V2_RATE_LIMITS`.
+    ///
+    /// The probe is the message the custom table classifies DIFFERENTLY — the third handshake,
+    /// refused under a cap of two. Both the `Default`-built and the explicitly
+    /// `V2_RATE_LIMITS`-built limiter must admit it, which is a claim a `Default` accidentally
+    /// rerouted to some other table could not satisfy.
+    #[test]
+    fn default_still_derives_from_the_upstream_table() {
+        let via_default = admit_handshakes(OpcodeRateLimits::default(), 3);
+        let via_upstream = admit_handshakes(OpcodeRateLimits::from(&*V2_RATE_LIMITS), 3);
+
+        assert_eq!(
+            via_default, via_upstream,
+            "Default no longer agrees with the table it is documented to derive from"
+        );
+        assert_eq!(
+            via_default[2],
+            Admission::Admitted,
+            "upstream admits a third handshake (frequency 5); this probe cannot distinguish tables \
+             if it does not"
+        );
     }
 
     /// A DIG opcode has no upstream entry, so it is governed by `default_settings` — it is
