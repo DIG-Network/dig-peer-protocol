@@ -108,20 +108,15 @@ DigMessage::MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024  // 16 MiB — see §2.2
 
 `DigMessage` is `Debug + Clone + PartialEq + Eq`.
 
-### 2.4 Interoperability with `chia_protocol::Message`
+### 2.4 No interoperability with `chia_protocol::Message`
 
-- `DigMessage::from_chia_message(&Message) -> DigMessage` — lossless; the enum
-  discriminant becomes the raw `u8`. Clones `msg.data`.
-- `DigMessage::from_chia_message_owned(Message) -> DigMessage` — same conversion,
-  taking `Message` by value and moving `data` instead of cloning it. Prefer this when
-  the source `Message` does not need to be kept afterward.
-- `DigMessage::try_into_chia_message(&self) -> Option<Message>` — succeeds iff
-  `msg_type` is a valid `ProtocolMessageTypes` discriminant; MUST return `None` for
-  opcodes the Chia enum does not define. DIG-only traffic stays in `DigMessage`. Clones
-  `self.data`.
-- `DigMessage::into_chia_message(self) -> Option<Message>` — same conversion and same
-  failure condition, taking `self` by value and moving `data` instead of cloning it.
-  Prefer this when `self` does not need to be kept afterward.
+`DigMessage` MUST NOT provide conversion to or from `chia_protocol::Message`. The DIG
+envelope is native and self-contained; a cheap bridge to `Message` is an on-ramp back to
+the closed `ProtocolMessageTypes` enum this crate exists to escape.
+
+Traffic addressed to a chia full node uses `DigLink`'s typed `send`/`request`, which
+derive their opcode from `ChiaProtocolMessage` (§7). That is the only supported chia path.
+
 - Classification helpers: `is_dig_extension()` is `msg_type >= 200`;
   `is_chia_standard()` is `msg_type < 200`. The boundary is exactly 200
   (199 is Chia-standard, 200 is DIG-extension).
@@ -224,7 +219,7 @@ Payload fields, encoded with Chia `Streamable` in declaration order:
 |---|-------|------|---------------------|---------|
 | 1 | `ip` | `String` | u32 BE length + UTF-8 bytes | Externally reachable IP or hostname |
 | 2 | `port` | `u16` | u16 BE | P2P listening port |
-| 3 | `node_type` | `NodeType` | u8 discriminant | Declared service role; gossip nodes register as `NodeType::FullNode` |
+| 3 | `node_type` | `NodeType` (DIG-owned) | u8 discriminant, frozen at `FullNode=1`, `Harvester=2`, `Farmer=3`, `Timelord=4`, `Introducer=5`, `Wallet=6`, `DataLayer=7` | Declared service role; gossip nodes register as `NodeType::FullNode`. A byte naming no role MUST be refused, never defaulted. |
 
 API:
 
@@ -272,13 +267,13 @@ importing the underlying crates:
 
 | Source crate | Re-exported |
 |--------------|-------------|
-| `chia-protocol` | everything (`pub use chia_protocol::*`): `Message`, `Handshake`, `ProtocolMessageTypes`, `NodeType`, `Bytes`, `TimestampedPeerInfo`, … |
+| `chia-protocol` | `ChiaProtocolMessage`, `ProtocolMessageTypes`, `TimestampedPeerInfo` — NAMED only. There MUST NOT be a glob re-export: a consumer needing another chia wire type depends on `chia-protocol` directly. |
 | `chia-sdk-client` (always) | `load_ssl_cert`, `ClientError`, `Network`, `Peer`, `PeerOptions`, `RateLimit`, `RateLimiter`, `RateLimits`, `V2_RATE_LIMITS` |
 | `chia-sdk-client` (TLS-gated, §7) | `Client`, `ClientState`, `Connector`; `create_native_tls_connector` / `create_rustls_connector` per feature |
 | `chia-ssl` | `ChiaCertificate` |
 | `chia-traits` | `Streamable` |
 | `chia_streamable_macro` | `streamable` (proc macro) |
-| DIG extensions | `DigMessage`, `DigMessageType`, `UnknownDigMessageType`, `RegisterPeer`, `RegisterAck`, `RequestPeersIntroducer`, `RespondPeersIntroducer` |
+| DIG extensions | `Bytes`, `NodeType`, `UnknownNodeType`, `DigMessage`, `DigMessageType`, `UnknownDigMessageType`, `RegisterPeer`, `RegisterAck`, `RequestPeersIntroducer`, `RespondPeersIntroducer` |
 | DIG opcodes | `DIG_BAND_START`, `FREE_BAND_START`, `DIG_MESSAGE`, `STORE_MELTED`, `HOLDINGS_ANNOUNCE`, `ALL_DIG_OPCODES`, `is_dig_opcode` |
 | DIG peer link (§7) | `DigLink`, `LinkOptions`, `LinkError`, `OpcodeRateLimiter`, `OpcodeRateLimits` |
 

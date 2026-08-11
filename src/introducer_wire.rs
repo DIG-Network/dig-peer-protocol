@@ -13,12 +13,13 @@
 //! manually and provide `to_dig_message`/`from_dig_message` helpers for wire encoding
 //! via [`DigMessage`] instead of the `ChiaProtocolMessage` trait.
 
-use chia_protocol::{NodeType, TimestampedPeerInfo};
+use chia_protocol::TimestampedPeerInfo;
 use chia_streamable_macro::streamable;
 use chia_traits::Streamable;
 
 use crate::dig_message::DigMessage;
 use crate::dig_message_type::DigMessageType;
+use crate::node_type::NodeType;
 
 // ---------------------------------------------------------------------------
 // Chia-standard introducer types (opcodes 63/64)
@@ -134,7 +135,7 @@ mod tests {
 
     #[test]
     fn wrong_opcode_returns_none() {
-        let msg = DigMessage::new(200, None, chia_protocol::Bytes::default());
+        let msg = DigMessage::new(200, None, crate::Bytes::default());
         assert!(RegisterPeer::from_dig_message(&msg).is_none());
         assert!(RegisterAck::from_dig_message(&msg).is_none());
     }
@@ -181,7 +182,7 @@ mod tests {
         let bad = DigMessage::new(
             DigMessageType::RegisterPeer as u8,
             None,
-            chia_protocol::Bytes::new(vec![0xFF]), // not a valid RegisterPeer encoding
+            crate::Bytes::new(vec![0xFF]), // not a valid RegisterPeer encoding
         );
         let result = RegisterPeer::from_dig_message(&bad);
         let inner = result.expect("opcode matched, so we get Some(..)");
@@ -194,7 +195,7 @@ mod tests {
         let bad = DigMessage::new(
             DigMessageType::RegisterAck as u8,
             None,
-            chia_protocol::Bytes::default(),
+            crate::Bytes::default(),
         );
         let result = RegisterAck::from_dig_message(&bad);
         let inner = result.expect("opcode matched, so we get Some(..)");
