@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.0] - 2026-08-11
+
+### Features
+- **wire:** Standardize the DIG peer wire on native types, drop the chia bridge (#6)
+
 ## [0.3.0] - 2026-08-09
 
 ### Features
