@@ -59,7 +59,11 @@ impl RequestMap {
     ///
     /// `expected` lists the opcodes that may complete the waiter; any other frame carrying this
     /// id belongs to the application (see [`Self::take_matching`]).
-    pub(crate) async fn insert(&self, sender: oneshot::Sender<DigMessage>, expected: Vec<u8>) -> u16 {
+    pub(crate) async fn insert(
+        &self,
+        sender: oneshot::Sender<DigMessage>,
+        expected: Vec<u8>,
+    ) -> u16 {
         let permit = self
             .capacity
             .clone()

@@ -347,8 +347,19 @@ frame under overload is permitted and expected.
 ### 7.3 Correlated requests
 
 `request_raw` / `request_dig` / `request_infallible` / `request_fallible` MUST allocate an
-unused `u16` id, send with that id, and resolve when a message bearing it arrives.
+unused `u16` id, send with that id, and resolve when a matching reply arrives.
 Concurrent requests MUST be bounded by the id space so an id is always available.
+
+**A waiter MUST be completed on the id AND the opcode, never on the id alone.** Every request
+records the reply opcode(s) that may complete it — supplied by the caller (`request_dig`) or
+derived from the reply type (`request_raw`, `request_infallible`, `request_fallible`) — and a
+frame carrying a live id but any other opcode MUST be delivered to the application with the
+waiter left pending. Each side allocates ids from its own counter starting at 0, so the peer's
+own *request* routinely carries an id we are waiting on; completing the waiter with it both
+fails that request (the frame is not a reply and will not parse as one) and loses the peer's
+request (the application never sees it, so it is never answered), which times out both ends of
+the link at once. An implementation MUST NOT infer reply opcodes from a built-in table of
+protocol semantics; the link does not know which opcode answers which.
 
 Every request MUST carry a deadline (`LinkOptions::request_timeout`). On expiry the request
 MUST fail with `LinkError::RequestTimeout` and its id MUST be reclaimed immediately, so a
@@ -483,9 +494,10 @@ Runtime configuration is limited to `LinkOptions` (§7), which scales the outbou
 | C11 | An inbound DIG opcode (218) is decoded and delivered, and the link survives it — where `Message::from_bytes` would reject the same frame and end the loop | §7.1; `tests/inbound_dig_opcode.rs` |
 | C12 | An inbound message whose id matches no live waiter is delivered to the application, not treated as fatal | §7.2; `tests/inbound_dig_opcode.rs` |
 | C13 | Chia opcodes keep their upstream rate limits under the re-keyed table; a caller-supplied table governs the limiter and `Default` still derives from `V2_RATE_LIMITS`; DIG opcodes fall to `default_settings`; budgets are enforced from both sides of the bound | §7.4; tests in `src/rate_limit.rs` |
-| C16 | A `Direction::Inbound` limiter charges a REFUSED frame against the per-opcode counters and both `non_tx` aggregates, so a flood of frames refused on size still exhausts the window; a `Direction::Outbound` limiter charges nothing for a refusal | §7.4.1; tests in `src/rate_limit.rs` |
 | C14 | A malformed binary frame is skipped, not fatal: the frame that follows it still decodes and routes to its correlated waiter | §7.1 rule 4; `tests/inbound_dig_opcode.rs` |
 | C15 | A late reply to a request that has already timed out is never delivered to a subsequent waiter | §7.3; `tests/link_liveness.rs` |
+| C16 | A `Direction::Inbound` limiter charges a REFUSED frame against the per-opcode counters and both `non_tx` aggregates, so a flood of frames refused on size still exhausts the window; a `Direction::Outbound` limiter charges nothing for a refusal | §7.4.1; tests in `src/rate_limit.rs` |
+| C17 | An inbound REQUEST carrying a correlation id we are waiting on is delivered to the application and leaves the waiter pending; only a declared reply opcode completes it | §7.3; `tests/link_liveness.rs` |
 
 Peer implementations (any language) MUST reproduce C1–C6 and C10 byte-for-byte to interoperate
 with DIG nodes. The gossip layer consuming these opcodes and the introducer/relay

@@ -327,8 +327,12 @@ impl DigLink {
         R: ChiaProtocolMessage,
         B: Streamable + ChiaProtocolMessage,
     {
-        self.request_message(opcode_of::<B>()?, body.to_bytes()?.into(), vec![opcode_of::<R>()?])
-            .await
+        self.request_message(
+            opcode_of::<B>()?,
+            body.to_bytes()?.into(),
+            vec![opcode_of::<R>()?],
+        )
+        .await
     }
 
     /// Send a DIG-band body and await a correlated reply carrying one of `expected`, unparsed.
@@ -456,12 +460,18 @@ fn peer_addr_of(ws: &WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Socke
 ///
 /// 1. **Decoding never depends on the opcode being known.** `DigMessage::from_bytes` accepts any
 ///    `u8`, so an inbound DIG opcode is a normal message rather than a fatal decode error.
-/// 2. **An unmatched correlation id is delivered, not fatal.** Upstream returns `Err` — which
-///    ends the loop and drops the connection — when a reply arrives for an id it is not waiting
-///    on. But ids are chosen independently by each side, so a peer's *request* id routinely
-///    collides with one of our outstanding request ids; and a hostile peer could drop the link at
-///    will by sending one unknown id. Here, anything not matching a live waiter goes to the
-///    application, which is where an inbound request belongs anyway.
+/// 2. **An unmatched frame is delivered, not fatal.** Upstream returns `Err` — which ends the
+///    loop and drops the connection — when a reply arrives for an id it is not waiting on. But
+///    ids are chosen independently by each side, so a peer's *request* id routinely collides with
+///    one of our outstanding request ids; and a hostile peer could drop the link at will by
+///    sending one unknown id. Here, anything not matching a live waiter goes to the application,
+///    which is where an inbound request belongs anyway.
+///
+///    "Matching" means the id AND the opcode. A live id is not on its own evidence that a frame
+///    answers our request: because both counters start at 0, the peer's own request frequently
+///    carries an id we are waiting on, and completing the waiter with it loses the request and
+///    fails the reply in one step. A waiter is completed only by an opcode it declared it was
+///    waiting for.
 /// 3. **A frame that does not decode is skipped, not fatal.** Websocket frames are
 ///    self-delimiting: tungstenite hands this loop whole `Binary` payloads, and the loop never
 ///    reads a length off a byte stream itself. So an undecodable payload costs exactly that
@@ -499,7 +509,7 @@ async fn read_inbound(
                 };
 
                 let unmatched = match message.id {
-                    Some(id) => match requests.cancel(id).await {
+                    Some(id) => match requests.take_matching(id, message.msg_type).await {
                         Some(waiter) => {
                             waiter.send(message);
                             continue;
