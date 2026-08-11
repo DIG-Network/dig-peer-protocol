@@ -39,7 +39,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, warn};
 
 use crate::{
-    rate_limit::{Admission, OpcodeRateLimiter, OpcodeRateLimits},
+    rate_limit::{Admission, Direction, OpcodeRateLimiter, OpcodeRateLimits},
     request_map::RequestMap,
     Bytes, DigMessage, LinkError,
 };
@@ -240,6 +240,9 @@ impl DigLink {
             requests,
             socket_addr,
             outbound_rate_limiter: Mutex::new(OpcodeRateLimiter::new(
+                // The send path: we chose not to send, so a refusal must not penalise a caller
+                // that backs off and retries.
+                Direction::Outbound,
                 RATE_LIMIT_WINDOW_SECONDS,
                 options.rate_limit_factor,
                 OpcodeRateLimits::default(),
