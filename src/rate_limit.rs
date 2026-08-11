@@ -83,7 +83,7 @@ impl Default for OpcodeRateLimits {
     }
 }
 
-/// The verdict on one outbound message.
+/// The verdict on one message, in either [`Direction`].
 ///
 /// Refusal is split in two because the two halves demand opposite caller behaviour: one is
 /// worth waiting out, the other is a permanent error.
@@ -607,7 +607,8 @@ mod tests {
     /// neither blocked outright nor unlimited. Sending one message must pass.
     #[test]
     fn dig_opcodes_fall_back_to_the_default_budget() {
-        let mut limiter = OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
+        let mut limiter =
+            OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
         assert!(limiter.allow(&message(DIG_MESSAGE, 16)));
     }
 
@@ -656,7 +657,8 @@ mod tests {
             "an exhausted frequency budget resets on the next window, so waiting can help"
         );
 
-        let mut fresh = OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
+        let mut fresh =
+            OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
         assert_eq!(
             fresh.admit(&message(DIG_MESSAGE, max_size + 1)),
             Admission::Unsendable,
@@ -674,10 +676,12 @@ mod tests {
     fn size_cap_is_pinned_from_both_sides() {
         let max_size = OpcodeRateLimits::default().default_settings.max_size as usize;
 
-        let mut at_bound = OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
+        let mut at_bound =
+            OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
         assert!(at_bound.allow(&message(DIG_MESSAGE, max_size)));
 
-        let mut over_bound = OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
+        let mut over_bound =
+            OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
         assert!(!over_bound.allow(&message(DIG_MESSAGE, max_size + 1)));
     }
 

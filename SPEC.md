@@ -365,13 +365,34 @@ A reply
 whose opcode matches none of the expected ones MUST fail with `LinkError::InvalidResponse`
 carrying the raw opcodes — never a `ProtocolMessageTypes`, which cannot name a DIG opcode.
 
-### 7.4 Outbound rate limiting
+### 7.4 Rate limiting
 
-Outbound messages MUST pass an `OpcodeRateLimiter` before being written. Its limits are
-**derived** from Chia's `V2_RATE_LIMITS` by re-keying each entry to its wire byte, so a
-Chia opcode is limited exactly as a stock peer limits it; DIG opcodes have no upstream
-entry and fall to `default_settings`. A refused message MUST NOT be charged against the
-budget.
+Outbound messages MUST pass an `OpcodeRateLimiter` before being written, and an inbound
+gate MAY use one over received frames. Its limits are **derived** from Chia's
+`V2_RATE_LIMITS` by re-keying each entry to its wire byte, so a Chia opcode is limited
+exactly as a stock peer limits it; DIG opcodes have no upstream entry and fall to
+`default_settings`.
+
+#### 7.4.1 Directional accounting of refusals
+
+A limiter is constructed for one `Direction`, which selects the accounting rule for a
+**refused** message. The verdict itself (§7.4.2) MUST be computed identically in both
+directions; only the charging differs.
+
+| `Direction` | Guards | A refused message | Rationale |
+|---|---|---|---|
+| `Outbound` | messages we are about to send | MUST NOT be charged | We chose not to send; a caller that backs off and retries MUST NOT be permanently penalised for having asked early. |
+| `Inbound` | frames received from a peer | MUST be charged | The peer already spent our bandwidth delivering the frame. |
+
+An `Inbound` limiter MUST charge a refusal in full: the per-opcode count, the per-opcode
+cumulative size, and — where the opcode counts against the non-transaction aggregates —
+both `non_tx_count` and `non_tx_size`. This is the anti-flood ratchet: a peer whose frames
+are being refused keeps burning the window, so the window stays exhausted. Without it, a
+peer sending frames refused on size alone pays nothing and the flood is unbounded.
+
+The direction MUST be named at the construction site (`Direction::Inbound` /
+`Direction::Outbound`), never encoded as a positional boolean, so that a signature change
+cannot drop it silently.
 
 The source table is selectable: `OpcodeRateLimits` implements `From<&RateLimits>`, and
 `Default` is defined as `From<&V2_RATE_LIMITS>`. The limits remain derived under either —
@@ -379,6 +400,8 @@ a caller chooses the *table*, never an individual limit, and the type exposes no
 constructor. A supplied table MUST be keyed by the `chia_protocol::ProtocolMessageTypes`
 this crate resolves (re-exported from its root); a table keyed by another version's enum
 re-keys to shifted wire bytes, silently loosening every Chia opcode to `default_settings`.
+
+#### 7.4.2 Classification of a refusal
 
 A refusal MUST be classified, because the two kinds demand opposite behaviour:
 
@@ -460,6 +483,7 @@ Runtime configuration is limited to `LinkOptions` (§7), which scales the outbou
 | C11 | An inbound DIG opcode (218) is decoded and delivered, and the link survives it — where `Message::from_bytes` would reject the same frame and end the loop | §7.1; `tests/inbound_dig_opcode.rs` |
 | C12 | An inbound message whose id matches no live waiter is delivered to the application, not treated as fatal | §7.2; `tests/inbound_dig_opcode.rs` |
 | C13 | Chia opcodes keep their upstream rate limits under the re-keyed table; a caller-supplied table governs the limiter and `Default` still derives from `V2_RATE_LIMITS`; DIG opcodes fall to `default_settings`; budgets are enforced from both sides of the bound | §7.4; tests in `src/rate_limit.rs` |
+| C16 | A `Direction::Inbound` limiter charges a REFUSED frame against the per-opcode counters and both `non_tx` aggregates, so a flood of frames refused on size still exhausts the window; a `Direction::Outbound` limiter charges nothing for a refusal | §7.4.1; tests in `src/rate_limit.rs` |
 | C14 | A malformed binary frame is skipped, not fatal: the frame that follows it still decodes and routes to its correlated waiter | §7.1 rule 4; `tests/inbound_dig_opcode.rs` |
 | C15 | A late reply to a request that has already timed out is never delivered to a subsequent waiter | §7.3; `tests/link_liveness.rs` |
 
