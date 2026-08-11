@@ -327,4 +327,108 @@ mod tests {
         let mut over_bound = OpcodeRateLimiter::new(60, 1.0, OpcodeRateLimits::default());
         assert!(!over_bound.allow(&message(DIG_MESSAGE, max_size + 1)));
     }
+
+    /// The re-keyed table is pinned to ABSOLUTE values, opcode byte by opcode byte.
+    ///
+    /// This is the test the module header's lockstep warning demands. `V2_RATE_LIMITS` comes from
+    /// `chia-sdk-client` keyed by `chia_protocol::ProtocolMessageTypes`; `rekey` derives each
+    /// opcode byte by *streaming that enum*. If the two crates ever resolve different versions of
+    /// it, the derived bytes shift, every Chia opcode misses its entry and falls to
+    /// `default_settings` — a large LOOSENING, with no compile error and no panic. A silently
+    /// permissive rate limiter is a DoS surface.
+    ///
+    /// A test comparing this table against `V2_RATE_LIMITS` cannot see that: it would ask the
+    /// same possibly-shifted enum for the key and agree with itself. So the expectations below
+    /// are literals — the opcode byte and both limit numbers, transcribed from the upstream table
+    /// and independent of any enum this crate can resolve.
+    ///
+    /// The chosen opcodes discriminate against the specific failure: `Handshake` (1) sits in
+    /// `other` with an entry FAR tighter than `default_settings` on both axes, so a
+    /// fall-to-default shows up as a wrong number rather than a missing key; `NewTransaction`
+    /// (21) and `TransactionAck` (49) sit in `tx`, so a re-key that dropped one map while
+    /// keeping the other still fails here.
+    #[test]
+    fn the_rekeyed_table_pins_upstream_limits_at_absolute_values() {
+        let limits = OpcodeRateLimits::default();
+
+        // (opcode byte, which map, frequency, max_size)
+        let handshake = limits
+            .other
+            .get(&1)
+            .expect("opcode 1 (Handshake) kept its entry");
+        assert_eq!(handshake.frequency, 5.0, "Handshake frequency");
+        assert_eq!(handshake.max_size, 10.0 * 1024.0, "Handshake max_size");
+
+        let tx_ack = limits
+            .tx
+            .get(&49)
+            .expect("opcode 49 (TransactionAck) kept its tx entry");
+        assert_eq!(tx_ack.frequency, 5000.0, "TransactionAck frequency");
+        assert_eq!(tx_ack.max_size, 2048.0, "TransactionAck max_size");
+
+        let new_tx = limits
+            .tx
+            .get(&21)
+            .expect("opcode 21 (NewTransaction) kept its tx entry");
+        assert_eq!(new_tx.frequency, 5000.0, "NewTransaction frequency");
+        assert_eq!(new_tx.max_size, 100.0, "NewTransaction max_size");
+
+        // The aggregate budgets are part of the same table and equally silent if lost.
+        assert_eq!(limits.non_tx_frequency, 1000.0);
+        assert_eq!(limits.non_tx_max_total_size, 100.0 * 1024.0 * 1024.0);
+        assert_eq!(limits.default_settings.frequency, 100.0);
+        assert_eq!(limits.default_settings.max_size, 1024.0 * 1024.0);
+    }
+
+    /// A pinned entry must be TIGHTER than `default_settings`, or the test above could pass on a
+    /// table that had silently collapsed to the default everywhere.
+    ///
+    /// This is the guard against the exact vacuity the module header warns about: it names the
+    /// property ("losing an entry is a loosening") rather than restating a number, so it stays
+    /// meaningful even if upstream retunes the values.
+    #[test]
+    fn falling_back_to_the_default_would_be_a_detectable_loosening() {
+        let limits = OpcodeRateLimits::default();
+        let handshake = limits
+            .other
+            .get(&1)
+            .expect("opcode 1 (Handshake) kept its entry");
+
+        assert!(
+            handshake.frequency < limits.default_settings.frequency,
+            "Handshake ({}) is not tighter than default ({}) -- the pin above can no longer              distinguish a re-keyed table from a collapsed one",
+            handshake.frequency,
+            limits.default_settings.frequency
+        );
+        assert!(
+            handshake.max_size < limits.default_settings.max_size,
+            "Handshake max_size is not tighter than default"
+        );
+    }
+
+    /// The table must retain a REALISTIC number of entries. An emptied `other` map would still
+    /// satisfy a test that only inspected keys it happens to look up, if those lookups were
+    /// themselves derived from the same shifted enum.
+    #[test]
+    fn the_rekeyed_table_retains_the_bulk_of_the_upstream_entries() {
+        let limits = OpcodeRateLimits::default();
+        assert!(
+            limits.other.len() >= 30,
+            "other map holds only {} entries -- the re-key lost most of the table",
+            limits.other.len()
+        );
+        assert!(
+            limits.tx.len() >= 5,
+            "tx map holds only {} entries -- the re-key lost most of the table",
+            limits.tx.len()
+        );
+        // Every key must be a real wire byte; a shifted enum would produce values outside the
+        // chia band, which is a direct signal of the version split.
+        for opcode in limits.other.keys().chain(limits.tx.keys()) {
+            assert!(
+                *opcode < 200,
+                "opcode {opcode} is outside the chia band -- the re-key is keying off a                  different ProtocolMessageTypes than the wire uses"
+            );
+        }
+    }
 }

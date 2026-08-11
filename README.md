@@ -113,10 +113,6 @@ impl DigMessage {
     pub fn from_bytes_owned(buf: Vec<u8>) -> Option<Self>;   // same rules; moves payload instead of copying
 
     // Interop with stock Chia Message
-    pub fn from_chia_message(msg: &Message) -> Self;                   // lossless, clones data
-    pub fn from_chia_message_owned(msg: Message) -> Self;              // lossless, moves data
-    pub fn try_into_chia_message(&self) -> Option<Message>;            // None if opcode ∉ ProtocolMessageTypes; clones data
-    pub fn into_chia_message(self) -> Option<Message>;                 // same, moves data
 
     // Opcode-range predicates
     pub fn is_dig_extension(&self) -> bool;   // msg_type >= 200
@@ -132,10 +128,6 @@ impl DigMessage {
 | `to_bytes`                | `&self`                  | `Vec<u8>`                          | infallible                         |
 | `from_bytes`              | `&[u8]`                  | `Option<DigMessage>`               | `None` if truncated or `data_len` > `MAX_MESSAGE_SIZE` |
 | `from_bytes_owned`        | `Vec<u8>`                | `Option<DigMessage>`               | same as `from_bytes`; moves payload, no copy |
-| `from_chia_message`       | `&Message`               | `DigMessage`                       | infallible; clones payload         |
-| `from_chia_message_owned` | `Message`                | `DigMessage`                       | infallible; moves payload          |
-| `try_into_chia_message`   | `&self`                  | `Option<Message>`                  | `None` if opcode not in Chia enum; clones payload |
-| `into_chia_message`       | `self`                   | `Option<Message>`                  | same as `try_into_chia_message`; moves payload |
 
 `from_bytes`/`from_bytes_owned` reject any `data_len` prefix above `MAX_MESSAGE_SIZE`
 (16 MiB) before slicing/allocating the payload. This bounds only the allocation these
@@ -266,7 +258,7 @@ These use `#[streamable(message)]` because opcodes 63/64 exist in stock `Protoco
 
 | Category          | Types                                                                             |
 |-------------------|-----------------------------------------------------------------------------------|
-| Framing           | `Message`, `Handshake`, `ProtocolMessageTypes`, `NodeType`, `Bytes`, `BytesImpl`  |
+| Framing           | DIG-owned `DigMessage`, `Bytes`, `NodeType`; `ProtocolMessageTypes` + `ChiaProtocolMessage` + `TimestampedPeerInfo` re-exported by name for chia paths |
 | Block             | `FullBlock`, `HeaderBlock`, `BlockRecord`, `Foliage`, `FoliageBlockData`          |
 | Peer discovery    | `RequestPeers`, `RespondPeers`, `TimestampedPeerInfo`                              |
 | Mempool/tx        | `NewTransaction`, `RequestTransaction`, `RespondTransaction`, `MempoolItemsAdded` |
@@ -348,10 +340,9 @@ match DigMessageType::try_from(msg.msg_type) {
     }
     Ok(other)   => { /* dispatch other DIG opcode */ }
     Err(_)      => {
-        // Not a DIG opcode — try as Chia Message
-        if let Some(chia_msg) = msg.try_into_chia_message() {
-            // dispatch Chia handler
-        }
+        // Not a DIG opcode. `msg` still holds the raw opcode and payload; dispatch on
+        // `msg.msg_type` directly. There is deliberately no conversion to
+        // `chia_protocol::Message` — see SPEC.md §2.4.
     }
 }
 ```
