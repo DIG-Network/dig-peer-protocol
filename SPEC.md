@@ -362,6 +362,13 @@ Chia opcode is limited exactly as a stock peer limits it; DIG opcodes have no up
 entry and fall to `default_settings`. A refused message MUST NOT be charged against the
 budget.
 
+The source table is selectable: `OpcodeRateLimits` implements `From<&RateLimits>`, and
+`Default` is defined as `From<&V2_RATE_LIMITS>`. The limits remain derived under either —
+a caller chooses the *table*, never an individual limit, and the type exposes no field-wise
+constructor. A supplied table MUST be keyed by the `chia_protocol::ProtocolMessageTypes`
+this crate resolves (re-exported from its root); a table keyed by another version's enum
+re-keys to shifted wire bytes, silently loosening every Chia opcode to `default_settings`.
+
 A refusal MUST be classified, because the two kinds demand opposite behaviour:
 
 | Verdict | Meaning | Required sender behaviour |
@@ -441,7 +448,7 @@ Runtime configuration is limited to `LinkOptions` (§7), which scales the outbou
 | C10 | `DigMessage::to_bytes` is byte-identical to `chia_protocol::Message::to_bytes` for **every** opcode `chia-protocol` accepts, across present/absent ids and payloads spanning the `u32` length prefix | §2.1, §2.4; `tests/wire_compatibility.rs` |
 | C11 | An inbound DIG opcode (218) is decoded and delivered, and the link survives it — where `Message::from_bytes` would reject the same frame and end the loop | §7.1; `tests/inbound_dig_opcode.rs` |
 | C12 | An inbound message whose id matches no live waiter is delivered to the application, not treated as fatal | §7.2; `tests/inbound_dig_opcode.rs` |
-| C13 | Chia opcodes keep their upstream rate limits under the re-keyed table; DIG opcodes fall to `default_settings`; budgets are enforced from both sides of the bound | §7.4; tests in `src/rate_limit.rs` |
+| C13 | Chia opcodes keep their upstream rate limits under the re-keyed table; a caller-supplied table governs the limiter and `Default` still derives from `V2_RATE_LIMITS`; DIG opcodes fall to `default_settings`; budgets are enforced from both sides of the bound | §7.4; tests in `src/rate_limit.rs` |
 | C14 | A malformed binary frame is skipped, not fatal: the frame that follows it still decodes and routes to its correlated waiter | §7.1 rule 4; `tests/inbound_dig_opcode.rs` |
 | C15 | A late reply to a request that has already timed out is never delivered to a subsequent waiter | §7.3; `tests/link_liveness.rs` |
 
