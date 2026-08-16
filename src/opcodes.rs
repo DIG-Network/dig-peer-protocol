@@ -1,4 +1,4 @@
-//! The complete DIG opcode namespace — the `200..=222` band, in one place.
+//! The complete DIG opcode namespace — the `200..=225` band, in one place.
 //!
 //! DIG extends Chia's `ProtocolMessageTypes` (which stops at `RespondCostInfo = 107`) with a
 //! band that starts at **200**, leaving a 100-value gap for future upstream additions. The band
@@ -47,11 +47,38 @@ pub const STORE_MELTED: u8 = 221;
 /// [`STORE_MELTED`].
 pub const HOLDINGS_ANNOUNCE: u8 = 222;
 
-/// Every opcode DIG has assigned, ascending — the 20 consensus opcodes plus the 3 free-band ones.
+/// Wire opcode for a **profile-root announce** broadcast (epic #3008).
+///
+/// Body is exactly 64 bytes: `store_id ‖ root`, two 32-byte hashes with no framing, announcing
+/// the sender's current profile-SMT root for that store. A public all-peers flood, same §5.4
+/// carve-out as [`STORE_MELTED`].
+///
+/// **Deliberately unsigned.** The authority for a profile root is the on-chain root, not the
+/// announcing peer, so the receiver compares any announced root against chain before trusting
+/// it. A forged announce therefore costs an attacker one wasted [`PROFILE_BODY_REQUEST`] that
+/// then fails that compare — signing would buy no additional guarantee while adding a signature
+/// verification to every message of the highest-volume broadcast in the band.
+pub const PROFILE_ROOT_ANNOUNCE: u8 = 223;
+
+/// Wire opcode for a directed **profile-body request** (epic #3008).
+///
+/// Body is exactly 64 bytes: `store_id ‖ root`, asking one peer for the profile body behind a
+/// root learned from a [`PROFILE_ROOT_ANNOUNCE`]. Answered with [`PROFILE_BODY`].
+pub const PROFILE_BODY_REQUEST: u8 = 224;
+
+/// Wire opcode for a directed **profile-body** response (epic #3008).
+///
+/// Body is `store_id ‖ root ‖ len:u32be ‖ body` — the two 32-byte hashes the request named,
+/// then a big-endian length prefix and that many bytes of profile body. The receiver rehashes
+/// the body and compares against `root`, which is why the announce that started the exchange
+/// needs no signature.
+pub const PROFILE_BODY: u8 = 225;
+
+/// Every opcode DIG has assigned, ascending — the 20 consensus opcodes plus the 6 free-band ones.
 ///
 /// This is the list a peer link dispatches on and the list a conformance test checks against
 /// Chia's namespace for collisions.
-pub const ALL_DIG_OPCODES: [u8; 23] = [
+pub const ALL_DIG_OPCODES: [u8; 26] = [
     DigMessageType::NewAttestation as u8,
     DigMessageType::NewCheckpointProposal as u8,
     DigMessageType::NewCheckpointSignature as u8,
@@ -75,6 +102,9 @@ pub const ALL_DIG_OPCODES: [u8; 23] = [
     DIG_MESSAGE,
     STORE_MELTED,
     HOLDINGS_ANNOUNCE,
+    PROFILE_ROOT_ANNOUNCE,
+    PROFILE_BODY_REQUEST,
+    PROFILE_BODY,
 ];
 
 /// Whether `opcode` belongs to the DIG band rather than Chia's namespace.
@@ -91,7 +121,7 @@ pub const fn is_dig_opcode(opcode: u8) -> bool {
 mod tests {
     use super::{
         is_dig_opcode, ALL_DIG_OPCODES, DIG_BAND_START, DIG_MESSAGE, FREE_BAND_START,
-        HOLDINGS_ANNOUNCE, STORE_MELTED,
+        HOLDINGS_ANNOUNCE, PROFILE_BODY, PROFILE_BODY_REQUEST, PROFILE_ROOT_ANNOUNCE, STORE_MELTED,
     };
     use chia_protocol::ProtocolMessageTypes;
     use chia_traits::Streamable;
@@ -114,18 +144,34 @@ mod tests {
     /// opcode was silently dropped from the list, a duplicate that two protocols share a byte.
     #[test]
     fn the_assigned_band_is_contiguous_from_200() {
-        let expected: Vec<u8> = (DIG_BAND_START..=HOLDINGS_ANNOUNCE).collect();
+        let expected: Vec<u8> = (DIG_BAND_START..=PROFILE_BODY).collect();
         assert_eq!(ALL_DIG_OPCODES.to_vec(), expected);
     }
 
-    /// The free band starts exactly where the consensus band ends, and its three assigned
-    /// values are pinned — these are cross-repo canonical constants that must not drift.
+    /// The free band starts exactly where the consensus band ends, and every assigned value is
+    /// pinned — these are cross-repo canonical constants that must not drift.
     #[test]
     fn free_band_constants_are_pinned() {
         assert_eq!(FREE_BAND_START, 220);
         assert_eq!(DIG_MESSAGE, 220);
         assert_eq!(STORE_MELTED, 221);
         assert_eq!(HOLDINGS_ANNOUNCE, 222);
+        assert_eq!(PROFILE_ROOT_ANNOUNCE, 223);
+        assert_eq!(PROFILE_BODY_REQUEST, 224);
+        assert_eq!(PROFILE_BODY, 225);
+    }
+
+    /// The three profile-SMT opcodes are a single indivisible allocation: each one must be
+    /// present in the dispatch list, in order, or the sync protocol is only half-routable. A
+    /// list missing just the middle value still passes a naive "highest value is 225" check,
+    /// so this asserts the exact contiguous triple as a slice.
+    #[test]
+    fn the_profile_sync_triple_is_assigned_together() {
+        let tail = &ALL_DIG_OPCODES[ALL_DIG_OPCODES.len() - 3..];
+        assert_eq!(
+            tail,
+            [PROFILE_ROOT_ANNOUNCE, PROFILE_BODY_REQUEST, PROFILE_BODY]
+        );
     }
 
     /// The band predicate is pinned from BOTH sides: 199 is Chia's, 200 is DIG's.

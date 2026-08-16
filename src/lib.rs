@@ -7,7 +7,7 @@
 //!
 //! [`DigMessage`] is the envelope for every DIG message: a raw `u8` opcode, an optional
 //! correlation id, and a [`Bytes`] payload, encoded by this crate and nothing else. It carries
-//! the `200..=222` DIG opcode band, which `chia_protocol::Message` structurally cannot express —
+//! the `200..=225` DIG opcode band, which `chia_protocol::Message` structurally cannot express —
 //! its `ProtocolMessageTypes` is a closed `#[repr(u8)]` enum with no `Unknown(u8)`, so a DIG
 //! opcode is neither constructible nor decodable through it, and one inbound DIG frame drops a
 //! whole `chia-sdk-client` connection rather than that one frame.
@@ -120,7 +120,7 @@ pub use link::{DigLink, LinkOptions};
 pub use node_type::{NodeType, UnknownNodeType};
 pub use opcodes::{
     is_dig_opcode, ALL_DIG_OPCODES, DIG_BAND_START, DIG_MESSAGE, FREE_BAND_START,
-    HOLDINGS_ANNOUNCE, STORE_MELTED,
+    HOLDINGS_ANNOUNCE, PROFILE_BODY, PROFILE_BODY_REQUEST, PROFILE_ROOT_ANNOUNCE, STORE_MELTED,
 };
 pub use rate_limit::{Admission, OpcodeRateLimiter, OpcodeRateLimits};
 
