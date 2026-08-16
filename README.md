@@ -1,6 +1,6 @@
 # dig-peer-protocol
 
-DIG Network L2 protocol types — superset of [`chia-protocol`](https://crates.io/crates/chia-protocol) with extension opcodes **200–222** — plus `DigLink`, the websocket peer link that can actually carry them.
+DIG Network L2 protocol types — superset of [`chia-protocol`](https://crates.io/crates/chia-protocol) with extension opcodes **200–225** — plus `DigLink`, the websocket peer link that can actually carry them.
 
 One dependency replaces five: `chia-protocol`, `chia-sdk-client`, `chia-ssl`, `chia-traits`, `chia_streamable_macro` — all re-exported verbatim.
 
