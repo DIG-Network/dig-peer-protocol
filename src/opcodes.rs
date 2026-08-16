@@ -136,3 +136,4 @@ mod tests {
         assert!(is_dig_opcode(u8::MAX));
     }
 }
+
