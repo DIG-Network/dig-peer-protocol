@@ -22,6 +22,13 @@
 //! **If a vector in this file changes, the wire changed.** That is a coordinated network event,
 //! never a refactor.
 //!
+//! ## Provenance
+//!
+//! Every literal here was captured on the **chia-protocol 0.26.0** line and is preserved verbatim
+//! across the uplift to **0.36.1**: the 0.36.1 build reproduces each byte string exactly, in both
+//! directions. The version in the dependency manifest therefore moved without the wire moving,
+//! which is the only form of that uplift that deployed DIG peers can survive.
+//!
 //! ## Fixture design
 //!
 //! Each vector is chosen against the nearest wrong encoder rather than for convenience:
@@ -195,7 +202,10 @@ fn golden_respond_peers_introducer_body_empty_list() {
 /// Parse a lowercase hex literal into bytes. Panics on malformed input, which can only be a typo
 /// in a fixture — a test-authoring error, never a runtime condition.
 fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "hex literal must have even length");
+    assert!(
+        s.len().is_multiple_of(2),
+        "hex literal must have even length"
+    );
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid hex"))
         .collect()

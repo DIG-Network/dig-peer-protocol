@@ -1,6 +1,6 @@
 [package]
 name = "dig-peer-protocol"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Michael Taylor <michael@berkeleycompute.com>"]
 description = "DIG Network L2 protocol types extending Chia's wire protocol (opcodes 200+)"
@@ -12,17 +12,17 @@ categories = ["network-programming", "cryptography::cryptocurrencies"]
 
 [dependencies]
 # Chia ecosystem — dig-peer-protocol re-exports all of these so consumers only need one import.
-chia-protocol = "0.26"
-chia-traits = "0.26"
-chia_streamable_macro = "0.26"
-chia-sha2 = "0.26"
-chia-ssl = "0.26"
+chia-protocol = "0.36.1"
+chia-traits = "0.36.1"
+chia_streamable_macro = "0.36.1"
+chia-sha2 = "0.36.1"
+chia-ssl = "0.42.1"
 # LOCKSTEP: chia-sdk-client and chia-protocol must be bumped together.
 # src/rate_limit.rs re-keys V2_RATE_LIMITS through chia_protocol::ProtocolMessageTypes —
 # the derived opcode bytes are correct only while sdk-client's RateLimits is keyed by the
-# same ProtocolMessageTypes type imported from chia-protocol 0.26.  Bumping either crate
+# same ProtocolMessageTypes type imported from chia-protocol 0.36.  Bumping either crate
 # alone can silently shift the derived opcode bytes without a compile error.
-chia-sdk-client = { version = "0.28", default-features = false }
+chia-sdk-client = { version = "0.34", default-features = false }
 
 # Serialization for DigMessageType
 serde = { version = "1", features = ["derive"] }
