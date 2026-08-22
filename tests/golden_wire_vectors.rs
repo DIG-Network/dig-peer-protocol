@@ -173,3 +173,123 @@ fn golden_respond_peers_introducer_body_empty_list() {
         "00000000"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Decode direction — the blessed bytes must still be READ correctly
+// ---------------------------------------------------------------------------
+//
+// Every vector above proves the *encode* direction: our encoder still emits the bytes the live
+// network expects. That is only half the contract, and the half that a symmetric change cannot
+// break silently is the other half. If an upstream release moved both the encoder and the decoder
+// together — a renumbered discriminant, a widened length prefix, a reordered field — the encode
+// vectors above would fail loudly, but a change that moved *only* the decoder (a newly tolerated
+// prefix, a relaxed bound, a shifted field offset) would not be visible at all from the encode
+// side.
+//
+// So each vector below feeds a hex literal transcribed from the chia 0.26 line — the bytes a
+// deployed peer is putting on the wire today — into our decoder and asserts the reconstructed
+// value field by field. The literals are the *same* constants as the encode vectors, deliberately:
+// pairing one fixed byte string against both directions is what makes the pair a compatibility
+// proof rather than two independent round-trips.
+
+/// Parse a lowercase hex literal into bytes. Panics on malformed input, which can only be a typo
+/// in a fixture — a test-authoring error, never a runtime condition.
+fn unhex(s: &str) -> Vec<u8> {
+    assert!(s.len() % 2 == 0, "hex literal must have even length");
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid hex"))
+        .collect()
+}
+
+#[test]
+fn golden_decode_dig_message_frame_with_id_and_large_payload() {
+    let wire = {
+        let mut w = unhex("dc01010200000140");
+        w.extend_from_slice(&ramp(320));
+        w
+    };
+    let msg = DigMessage::from_bytes(&wire).expect("0.26-blessed frame must decode");
+    assert_eq!(msg.msg_type, 220);
+    assert_eq!(msg.id, Some(ASYMMETRIC_ID));
+    assert_eq!(msg.data.as_ref(), &ramp(320)[..]);
+}
+
+#[test]
+fn golden_decode_dig_message_frame_without_id_and_empty_payload() {
+    let msg = DigMessage::from_bytes(&unhex("da0000000000")).expect("blessed frame must decode");
+    assert_eq!(msg.msg_type, 218);
+    assert_eq!(msg.id, None);
+    assert!(msg.data.as_ref().is_empty());
+}
+
+#[test]
+fn golden_decode_dig_message_frame_chia_band_opcode() {
+    let msg =
+        DigMessage::from_bytes(&unhex("1401010200000002abcd")).expect("blessed frame must decode");
+    assert_eq!(msg.msg_type, 20);
+    assert_eq!(msg.id, Some(ASYMMETRIC_ID));
+    assert_eq!(msg.data.as_ref(), &[0xab, 0xcd]);
+}
+
+#[test]
+fn golden_decode_register_peer_body_full_node() {
+    let rp = RegisterPeer::from_bytes(&unhex("0000000b3139322e3136382e312e3124e401"))
+        .expect("0.26-blessed RegisterPeer must decode");
+    assert_eq!(rp.ip, "192.168.1.1");
+    assert_eq!(rp.port, 9444);
+    assert_eq!(rp.node_type, NodeType::FullNode);
+}
+
+#[test]
+fn golden_decode_register_peer_body_introducer_node_type() {
+    // The second NodeType, so the decoder is proven to read the discriminant rather than to
+    // return a constant that happens to match FullNode.
+    let rp = RegisterPeer::from_bytes(&unhex("0000000b3230332e302e3131332e37480c05"))
+        .expect("0.26-blessed RegisterPeer must decode");
+    assert_eq!(rp.ip, "203.0.113.7");
+    assert_eq!(rp.port, 18444);
+    assert_eq!(rp.node_type, NodeType::Introducer);
+}
+
+#[test]
+fn golden_decode_register_ack_body_both_polarities() {
+    assert!(
+        RegisterAck::from_bytes(&unhex("01"))
+            .expect("blessed RegisterAck must decode")
+            .success
+    );
+    assert!(
+        !RegisterAck::from_bytes(&unhex("00"))
+            .expect("blessed RegisterAck must decode")
+            .success
+    );
+}
+
+#[test]
+fn golden_decode_respond_peers_introducer_body_with_two_peers() {
+    let resp = RespondPeersIntroducer::from_bytes(&unhex(concat!(
+        "00000002",
+        "0000000b",
+        "3230332e302e3131332e37",
+        "24e4",
+        "000000006553f100",
+        "0000000d",
+        "3139382e35312e3130302e3432",
+        "480c",
+        "000000006553f2f4",
+    )))
+    .expect("0.26-blessed peer list must decode");
+    assert_eq!(
+        resp.peer_list,
+        vec![
+            TimestampedPeerInfo::new("203.0.113.7".into(), 9444, 1_700_000_000),
+            TimestampedPeerInfo::new("198.51.100.42".into(), 18444, 1_700_000_500),
+        ]
+    );
+}
+
+#[test]
+fn golden_decode_respond_peers_introducer_body_empty_list() {
+    let resp = RespondPeersIntroducer::from_bytes(&unhex("00000000")).expect("must decode");
+    assert!(resp.peer_list.is_empty());
+}
