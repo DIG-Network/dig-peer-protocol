@@ -299,6 +299,55 @@ mod tests {
         assert_eq!(ours.max_size, upstream.max_size);
     }
 
+    /// EVERY upstream opcode survives the re-key with its limits intact — not just `Handshake`.
+    ///
+    /// The single-entry check above cannot see the two failures this module's lockstep pin exists
+    /// to prevent, because both leave `Handshake` untouched while corrupting the rest of the table:
+    ///
+    /// - `rekey` is a `filter_map` whose `ok()?` / `first()?` DROP an entry that fails to encode,
+    ///   and a dropped Chia opcode silently falls through to `default_settings` — a loosening, in
+    ///   the permissive direction, with no compile error and no panic.
+    /// - two `ProtocolMessageTypes` variants that streamed to the SAME byte would collide in the
+    ///   `HashMap`, so one limit would silently overwrite the other.
+    ///
+    /// Cardinality is asserted as well as content precisely because both failures are subtractive:
+    /// a per-entry loop over the re-keyed map would still pass while entries were missing from it,
+    /// so the count is what makes a drop observable. Checking `tx` and `other` separately keeps a
+    /// row that moved between the two tables from cancelling out in a combined total.
+    #[test]
+    fn every_upstream_opcode_survives_the_rekey_with_its_limits() {
+        let ours = OpcodeRateLimits::default();
+        let upstream = &*V2_RATE_LIMITS;
+
+        for (label, upstream_map, our_map) in [
+            ("tx", &upstream.tx, &ours.tx),
+            ("other", &upstream.other, &ours.other),
+        ] {
+            assert_eq!(
+                our_map.len(),
+                upstream_map.len(),
+                "{label}: re-key changed the entry count, so an opcode was dropped or collided",
+            );
+            assert!(
+                !upstream_map.is_empty(),
+                "{label}: upstream table is empty, so this test proves nothing",
+            );
+
+            for (msg_type, expected) in upstream_map.iter() {
+                let opcode = *msg_type
+                    .to_bytes()
+                    .expect("ProtocolMessageTypes encodes")
+                    .first()
+                    .expect("one byte");
+                let got = our_map.get(&opcode).unwrap_or_else(|| {
+                    panic!("{label}: {msg_type:?} (opcode {opcode}) missing after re-key")
+                });
+                assert_eq!(got.frequency, expected.frequency, "{label}: {msg_type:?}");
+                assert_eq!(got.max_size, expected.max_size, "{label}: {msg_type:?}");
+            }
+        }
+    }
+
     /// A caller-supplied table governs the limiter — the CUSTOM row is honoured, not upstream's.
     ///
     /// The conversion is observed through behaviour rather than through the derived fields, so it
