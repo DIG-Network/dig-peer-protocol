@@ -27,6 +27,12 @@ chia-ssl = "0.42.1"
 # chia-protocol 0.36.1, so the lockstep holds and `Cargo.lock` carries ONE chia-protocol line.
 # The ceiling is the SDK's own dependency set, not the newest on crates.io -- the primitives
 # publish at 0.48 but the SDK cannot reach them, so raising them would break this lockstep.
+#
+# ENFORCED, not merely asserted: `every_upstream_opcode_survives_the_rekey_with_its_limits`
+# (src/rate_limit.rs) pins the rekeyed table's EXACT cardinality, so a shifted opcode byte fails
+# the suite instead of silently dropping that opcode to permissive defaults. The older `>= 30`
+# lower-bound check cannot catch that -- it has slack for exactly the subtractive loss this
+# lockstep exists to prevent. dig_ecosystem#3161.
 chia-sdk-client = { version = "0.36.0", default-features = false }
 
 # Serialization for DigMessageType
