@@ -201,6 +201,7 @@ async fn a_dig_request_correlates_with_its_response() {
         std::time::Duration::from_secs(5),
         requester.request_dig(
             DigMessageType::RequestStatus as u8,
+            &[DigMessageType::RespondStatus as u8],
             Bytes::new(b"ping".to_vec()),
         ),
     )
@@ -279,6 +280,7 @@ async fn a_malformed_frame_is_skipped_and_the_next_frame_still_routes() {
         std::time::Duration::from_secs(5),
         requester.request_dig(
             DigMessageType::RequestStatus as u8,
+            &[DigMessageType::RespondStatus as u8],
             Bytes::new(b"ping".to_vec()),
         ),
     )

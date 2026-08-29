@@ -347,12 +347,42 @@ frame under overload is permitted and expected.
 ### 7.3 Correlated requests
 
 `request_raw` / `request_dig` / `request_infallible` / `request_fallible` MUST allocate an
-unused `u16` id, send with that id, and resolve when a message bearing it arrives.
+unused `u16` id, send with that id, and resolve when a matching reply arrives.
 Concurrent requests MUST be bounded by the id space so an id is always available.
 
+**A waiter MUST NOT be answered on the id alone: the reply opcode MUST match too.** Every
+request records the reply opcode(s) that may complete it — supplied by the caller
+(`request_dig`) or derived from the reply type (`request_raw`, `request_infallible`,
+`request_fallible`). An implementation MUST NOT infer reply opcodes from a built-in table of
+protocol semantics; the link does not know which opcode answers which.
+
+A frame carrying a live request id under an opcode that request did not declare MUST be
+delivered to the application and MUST NOT complete the waiter. Each side allocates ids from its
+own counter starting at 0, so the peer's own *request* routinely carries an id we are waiting
+on; handing it to the waiter both fails that request (the frame is not a reply and will not
+parse as one) and loses the peer's request (the application never sees it, so it is never
+answered). It is also the hijack: a peer holding a live id could otherwise choose what an
+outstanding request returns.
+
+An implementation MUST NOT fail the waiter at that moment either. The two situations that
+produce such a frame — an honest id collision whose real reply is still in flight, and a peer
+answering with junk whose real reply will never come — are the same bytes on the wire and
+cannot be told apart on arrival. Failing on arrival resolves that ambiguity in favour of the
+second, breaking every honest collision and handing any peer a one-frame abort of an
+outstanding request by guessing a low id.
+
+The collision MUST instead be recorded against the waiter. If the real reply arrives, the
+request completes normally and the record costs nothing. If the deadline expires with a
+collision recorded, the request MUST fail with `LinkError::InvalidResponse` naming the declared
+opcodes and the offending one as raw `u8` — never a `ProtocolMessageTypes`, which cannot name a
+DIG opcode — rather than with `RequestTimeout`. The two are different faults with different
+remedies: `RequestTimeout` says the peer was silent, `InvalidResponse` says the peer answered
+with something that answers nothing asked, which is what a peer-penalty layer charges for.
+
 Every request MUST carry a deadline (`LinkOptions::request_timeout`). On expiry the request
-MUST fail with `LinkError::RequestTimeout` and its id MUST be reclaimed immediately, so a
-silent peer can neither hang the caller indefinitely nor exhaust the id space.
+MUST fail — with `LinkError::RequestTimeout`, or with `LinkError::InvalidResponse` where a
+collision was recorded above — and its id MUST be reclaimed immediately, so a silent peer can
+neither hang the caller indefinitely nor exhaust the id space.
 
 Ids MUST be allocated from a monotonically advancing wrapping cursor rather than
 lowest-free-first, so a reclaimed id is not reissued until the id space has wrapped. Reclaiming
@@ -361,17 +391,34 @@ late — answering the request that already timed out — then matches the new w
 delivered to it as though it were that request's answer. Nothing downstream can detect the
 substitution, so this MUST be prevented at allocation.
 
-A reply
-whose opcode matches none of the expected ones MUST fail with `LinkError::InvalidResponse`
-carrying the raw opcodes — never a `ProtocolMessageTypes`, which cannot name a DIG opcode.
+### 7.4 Rate limiting
 
-### 7.4 Outbound rate limiting
+Outbound messages MUST pass an `OpcodeRateLimiter` before being written, and an inbound
+gate MAY use one over received frames. Its limits are **derived** from Chia's
+`V2_RATE_LIMITS` by re-keying each entry to its wire byte, so a Chia opcode is limited
+exactly as a stock peer limits it; DIG opcodes have no upstream entry and fall to
+`default_settings`.
 
-Outbound messages MUST pass an `OpcodeRateLimiter` before being written. Its limits are
-**derived** from Chia's `V2_RATE_LIMITS` by re-keying each entry to its wire byte, so a
-Chia opcode is limited exactly as a stock peer limits it; DIG opcodes have no upstream
-entry and fall to `default_settings`. A refused message MUST NOT be charged against the
-budget.
+#### 7.4.1 Directional accounting of refusals
+
+A limiter is constructed for one `Direction`, which selects the accounting rule for a
+**refused** message. The verdict itself (§7.4.2) MUST be computed identically in both
+directions; only the charging differs.
+
+| `Direction` | Guards | A refused message | Rationale |
+|---|---|---|---|
+| `Outbound` | messages we are about to send | MUST NOT be charged | We chose not to send; a caller that backs off and retries MUST NOT be permanently penalised for having asked early. |
+| `Inbound` | frames received from a peer | MUST be charged | The peer already spent our bandwidth delivering the frame. |
+
+An `Inbound` limiter MUST charge a refusal in full: the per-opcode count, the per-opcode
+cumulative size, and — where the opcode counts against the non-transaction aggregates —
+both `non_tx_count` and `non_tx_size`. This is the anti-flood ratchet: a peer whose frames
+are being refused keeps burning the window, so the window stays exhausted. Without it, a
+peer sending frames refused on size alone pays nothing and the flood is unbounded.
+
+The direction MUST be named at the construction site (`Direction::Inbound` /
+`Direction::Outbound`), never encoded as a positional boolean, so that a signature change
+cannot drop it silently.
 
 The source table is selectable: `OpcodeRateLimits` implements `From<&RateLimits>`, and
 `Default` is defined as `From<&V2_RATE_LIMITS>`. The limits remain derived under either —
@@ -379,6 +426,8 @@ a caller chooses the *table*, never an individual limit, and the type exposes no
 constructor. A supplied table MUST be keyed by the `chia_protocol::ProtocolMessageTypes`
 this crate resolves (re-exported from its root); a table keyed by another version's enum
 re-keys to shifted wire bytes, silently loosening every Chia opcode to `default_settings`.
+
+#### 7.4.2 Classification of a refusal
 
 A refusal MUST be classified, because the two kinds demand opposite behaviour:
 
@@ -462,6 +511,8 @@ Runtime configuration is limited to `LinkOptions` (§7), which scales the outbou
 | C13 | Chia opcodes keep their upstream rate limits under the re-keyed table; a caller-supplied table governs the limiter and `Default` still derives from `V2_RATE_LIMITS`; DIG opcodes fall to `default_settings`; budgets are enforced from both sides of the bound | §7.4; tests in `src/rate_limit.rs` |
 | C14 | A malformed binary frame is skipped, not fatal: the frame that follows it still decodes and routes to its correlated waiter | §7.1 rule 4; `tests/inbound_dig_opcode.rs` |
 | C15 | A late reply to a request that has already timed out is never delivered to a subsequent waiter | §7.3; `tests/link_liveness.rs` |
+| C16 | A `Direction::Inbound` limiter charges a REFUSED frame against the per-opcode counters and both `non_tx` aggregates, so a flood of frames refused on size still exhausts the window; a `Direction::Outbound` limiter charges nothing for a refusal | §7.4.1; tests in `src/rate_limit.rs` |
+| C17 | An inbound REQUEST carrying a correlation id we are waiting on is delivered to the application and leaves the waiter pending; only a declared reply opcode completes it | §7.3; `tests/link_liveness.rs` |
 
 Peer implementations (any language) MUST reproduce C1–C6 and C10 byte-for-byte to interoperate
 with DIG nodes. The gossip layer consuming these opcodes and the introducer/relay

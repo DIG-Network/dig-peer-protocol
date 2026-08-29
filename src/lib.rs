@@ -122,7 +122,7 @@ pub use opcodes::{
     is_dig_opcode, ALL_DIG_OPCODES, DIG_BAND_START, DIG_MESSAGE, FREE_BAND_START,
     HOLDINGS_ANNOUNCE, PROFILE_BODY, PROFILE_BODY_REQUEST, PROFILE_ROOT_ANNOUNCE, STORE_MELTED,
 };
-pub use rate_limit::{Admission, OpcodeRateLimiter, OpcodeRateLimits};
+pub use rate_limit::{Admission, Direction, OpcodeRateLimiter, OpcodeRateLimits};
 
 #[cfg(test)]
 mod dig_message_opcode_tests {

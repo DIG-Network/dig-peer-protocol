@@ -1,4 +1,4 @@
-//! Outbound rate limiting for [`DigLink`], keyed by raw `u8` opcode.
+//! Directional rate limiting for [`DigLink`], keyed by raw `u8` opcode.
 //!
 //! Chia's own `RateLimiter` is keyed by `ProtocolMessageTypes`, an enum that cannot represent a
 //! DIG opcode — which is the same closed-namespace problem that forced the vendored fork in the
@@ -83,7 +83,7 @@ impl Default for OpcodeRateLimits {
     }
 }
 
-/// The verdict on one outbound message.
+/// The verdict on one message, in either [`Direction`].
 ///
 /// Refusal is split in two because the two halves demand opposite caller behaviour: one is
 /// worth waiting out, the other is a permanent error.
@@ -98,12 +98,35 @@ pub enum Admission {
     Unsendable,
 }
 
-/// A sliding-window outbound limiter over [`OpcodeRateLimits`].
+/// Which side of the link a limiter guards — and therefore whether a REFUSED message is charged.
+///
+/// The two directions need opposite accounting, and the difference is the anti-flood ratchet:
+///
+/// - [`Direction::Inbound`] charges a refusal, because the peer already spent our bandwidth
+///   delivering the frame. A peer whose frames are being rejected keeps burning the budget, so the
+///   window stays exhausted and the flood cannot run for free.
+/// - [`Direction::Outbound`] does not, because we chose not to send: a caller that backs off and
+///   retries must not be permanently penalised for having asked early.
+///
+/// This is an enum rather than upstream's positional `bool` deliberately. A bare `true` in
+/// `new(true, ..)` reads as nothing at the call site and can be dropped by a signature change with
+/// no reviewer noticing — which is exactly how the inbound rule went missing here once already.
+/// `Direction::Inbound` is checkable at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Frames received from a peer; a refusal IS charged.
+    Inbound,
+    /// Messages we are about to send; a refusal is NOT charged.
+    Outbound,
+}
+
+/// A sliding-window limiter over [`OpcodeRateLimits`], in one [`Direction`].
 ///
 /// Mirrors Chia's algorithm: per-period per-opcode count and cumulative size, plus an aggregate
 /// budget for everything that is not a transaction message.
 #[derive(Debug, Clone)]
 pub struct OpcodeRateLimiter {
+    direction: Direction,
     reset_seconds: u64,
     period: u64,
     limit_factor: f64,
@@ -115,13 +138,22 @@ pub struct OpcodeRateLimiter {
 }
 
 impl OpcodeRateLimiter {
-    /// A limiter over `limits`, resetting its window every `reset_seconds`.
+    /// A limiter over `limits` guarding `direction`, resetting its window every `reset_seconds`.
+    ///
+    /// `direction` selects the accounting rule for a REFUSED message — see [`Direction`]; it is
+    /// the first parameter so that a call site names it before anything else.
     ///
     /// `limit_factor` scales every budget, so a peer can be given a fraction of the nominal
     /// allowance (Chia's clients default to `0.6`).
     #[must_use]
-    pub fn new(reset_seconds: u64, limit_factor: f64, limits: OpcodeRateLimits) -> Self {
+    pub fn new(
+        direction: Direction,
+        reset_seconds: u64,
+        limit_factor: f64,
+        limits: OpcodeRateLimits,
+    ) -> Self {
         Self {
+            direction,
             reset_seconds,
             period: now_seconds() / reset_seconds,
             limit_factor,
@@ -133,10 +165,7 @@ impl OpcodeRateLimiter {
         }
     }
 
-    /// Whether `message` may be sent now, charging it against the budget when it may.
-    ///
-    /// A refused message is NOT charged, so a caller that backs off and retries is not
-    /// permanently penalised for having asked early.
+    /// Whether `message` passes the limiter now, charging it against the budget per [`Direction`].
     ///
     /// Prefer [`Self::admit`] where the caller intends to retry: `true`/`false` cannot say
     /// whether waiting could ever help.
@@ -144,12 +173,15 @@ impl OpcodeRateLimiter {
         self.admit(message) == Admission::Admitted
     }
 
-    /// Whether `message` may be sent now — and, when it may not, whether waiting could help.
+    /// Whether `message` passes now — and, when it does not, whether waiting could help.
     ///
     /// The distinction is what keeps a caller from spinning forever: a *frequency* or
     /// *cumulative* budget clears on the next window roll, but a message larger than the
     /// per-message cap (or than a whole window's budget) is refused identically in every window
     /// that will ever exist. Only [`Admission::Deferred`] is worth retrying.
+    ///
+    /// Whether a REFUSAL is charged depends on the limiter's [`Direction`], and nothing else: the
+    /// verdict itself is computed identically either way.
     pub fn admit(&mut self, message: &DigMessage) -> Admission {
         self.roll_window();
 
@@ -177,9 +209,6 @@ impl OpcodeRateLimiter {
             && (!counts_against_non_tx
                 || (1.0 <= self.limits.non_tx_frequency * self.limit_factor
                     && size <= self.limits.non_tx_max_total_size * self.limit_factor));
-        if !fits_an_empty_window {
-            return Admission::Unsendable;
-        }
 
         let new_count = self.counts.get(&opcode).unwrap_or(&0.0) + 1.0;
         let new_cumulative = self.cumulative_sizes.get(&opcode).unwrap_or(&0.0) + size;
@@ -189,20 +218,30 @@ impl OpcodeRateLimiter {
             (self.non_tx_count, self.non_tx_size)
         };
 
-        let allowed = new_non_tx_count <= self.limits.non_tx_frequency * self.limit_factor
+        let fits_this_window = new_non_tx_count <= self.limits.non_tx_frequency * self.limit_factor
             && new_non_tx_size <= self.limits.non_tx_max_total_size * self.limit_factor
             && new_count <= limit.frequency * self.limit_factor
             && new_cumulative <= max_total * self.limit_factor;
 
-        if !allowed {
-            return Admission::Deferred;
+        let verdict = match (fits_an_empty_window, fits_this_window) {
+            (false, _) => Admission::Unsendable,
+            (true, false) => Admission::Deferred,
+            (true, true) => Admission::Admitted,
+        };
+
+        // The one place the two directions differ. An inbound frame is charged even when refused,
+        // because the peer already spent our bandwidth delivering it — that is the ratchet that
+        // keeps a rejected flood from being free. An outbound refusal is not charged, because we
+        // chose not to send and a backing-off caller must not be penalised for asking early.
+        let charge = self.direction == Direction::Inbound || verdict == Admission::Admitted;
+        if charge {
+            self.counts.insert(opcode, new_count);
+            self.cumulative_sizes.insert(opcode, new_cumulative);
+            self.non_tx_count = new_non_tx_count;
+            self.non_tx_size = new_non_tx_size;
         }
 
-        self.counts.insert(opcode, new_count);
-        self.cumulative_sizes.insert(opcode, new_cumulative);
-        self.non_tx_count = new_non_tx_count;
-        self.non_tx_size = new_non_tx_size;
-        Admission::Admitted
+        verdict
     }
 
     /// Clear the accumulated budget when the wall clock crosses into a new window.
@@ -228,7 +267,7 @@ fn now_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Admission, OpcodeRateLimiter, OpcodeRateLimits};
+    use super::{Admission, Direction, OpcodeRateLimiter, OpcodeRateLimits};
     use crate::{Bytes, DigMessage, DIG_MESSAGE};
     use chia_protocol::ProtocolMessageTypes;
     use chia_sdk_client::{RateLimit, RateLimits, V2_RATE_LIMITS};
@@ -267,10 +306,180 @@ mod tests {
     /// bind: the only budget that can produce a refusal is `frequency`, which is the axis the
     /// custom table moves.
     fn admit_handshakes(limits: OpcodeRateLimits, count: usize) -> Vec<Admission> {
-        let mut limiter = OpcodeRateLimiter::new(60, 1.0, limits);
+        let mut limiter = OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, limits);
         (0..count)
             .map(|_| limiter.admit(&message(handshake_opcode(), 16)))
             .collect()
+    }
+
+    /// The wire byte `NewPeak` streams to — a SECOND `other` opcode, distinct from `Handshake`.
+    ///
+    /// A second opcode is what makes the aggregate tests possible: charging can be observed on a
+    /// message whose own per-opcode counters were never touched.
+    fn new_peak_opcode() -> u8 {
+        *ProtocolMessageTypes::NewPeak
+            .to_bytes()
+            .expect("encode")
+            .first()
+            .expect("one byte")
+    }
+
+    /// The size, in bytes, of a frame that `handshake_capped_at_two` refuses on SIZE alone.
+    ///
+    /// One byte over the table's own `max_size`, so the refusal is `Unsendable` — the flood shape
+    /// that used to cost the peer nothing.
+    const OVERSIZED_HANDSHAKE: usize = 10 * 1024 + 1;
+
+    /// Offer `count` oversized handshakes, then one perfectly legal handshake.
+    ///
+    /// Every oversized frame must be refused on size, and the closing legal frame is the probe:
+    /// its verdict is decided entirely by whether those refusals were charged.
+    fn flood_then_probe(direction: Direction) -> Admission {
+        let mut limiter = OpcodeRateLimiter::new(
+            direction,
+            60,
+            1.0,
+            OpcodeRateLimits::from(&handshake_capped_at_two()),
+        );
+
+        for i in 0..2 {
+            assert_eq!(
+                limiter.admit(&message(handshake_opcode(), OVERSIZED_HANDSHAKE)),
+                Admission::Unsendable,
+                "flood frame {i} was not refused on size -- the fixture is not exercising a refusal"
+            );
+        }
+
+        limiter.admit(&message(handshake_opcode(), 16))
+    }
+
+    /// An INBOUND refusal is charged: a peer flooding frames we reject still burns the window.
+    ///
+    /// The peer spent our bandwidth delivering each frame, so refusing it must ratchet the budget
+    /// down — otherwise a flood of frames that are all rejected on size costs the attacker nothing
+    /// and the limiter never closes. Two frames over a `frequency` of 2 exhaust the count, so the
+    /// closing LEGAL frame — which an empty window would admit — must now be refused.
+    ///
+    /// `Deferred`, not `Unsendable`: the probe fits an empty window, so the only thing that can
+    /// refuse it is an exhausted budget, and that budget can only be exhausted by the charges.
+    #[test]
+    fn an_inbound_refusal_is_charged_against_the_window() {
+        assert_eq!(
+            flood_then_probe(Direction::Inbound),
+            Admission::Deferred,
+            "a legal inbound frame was admitted after two refused frames -- the refusals were not \
+             charged, so a rejected flood is free"
+        );
+    }
+
+    /// An OUTBOUND refusal is NOT charged — the documented behaviour this fix must preserve.
+    ///
+    /// The control for the test above, on the IDENTICAL fixture: we chose not to send, so a caller
+    /// that backs off and retries must not be penalised for having asked early. That the same
+    /// sequence yields opposite verdicts is what proves the direction, and not the fixture, is
+    /// doing the work.
+    #[test]
+    fn an_outbound_refusal_is_not_charged_against_the_window() {
+        assert_eq!(
+            flood_then_probe(Direction::Outbound),
+            Admission::Admitted,
+            "a refused outbound message was charged -- a backing-off caller is now penalised"
+        );
+    }
+
+    /// The inbound charge reaches the shared `non_tx` COUNT aggregate, not only the per-opcode
+    /// counters.
+    ///
+    /// This is the axis the real-world flood runs on: oversized `Handshake` frames exhaust the
+    /// aggregate and lock out every other `other` opcode for the window. The probe is therefore a
+    /// DIFFERENT opcode (`NewPeak`), whose own counters were never touched — an implementation
+    /// that charged only per-opcode would admit it and leave the actual hole open.
+    ///
+    /// `Handshake`'s own frequency is raised well clear of the flood so it cannot be the budget
+    /// that binds, and `non_tx_frequency` is lowered to 2 so the aggregate is reached in two
+    /// frames rather than a thousand.
+    #[test]
+    fn an_inbound_refusal_is_charged_against_the_non_tx_count_aggregate() {
+        let probe = |direction| {
+            let mut table = V2_RATE_LIMITS.clone();
+            table.non_tx_frequency = 2.0;
+            table.other.insert(
+                ProtocolMessageTypes::Handshake,
+                RateLimit::new(100.0, 10.0 * 1024.0, None),
+            );
+            table.other.insert(
+                ProtocolMessageTypes::NewPeak,
+                RateLimit::new(100.0, 10.0 * 1024.0, None),
+            );
+
+            let mut limiter =
+                OpcodeRateLimiter::new(direction, 60, 1.0, OpcodeRateLimits::from(&table));
+            for _ in 0..2 {
+                assert_eq!(
+                    limiter.admit(&message(handshake_opcode(), OVERSIZED_HANDSHAKE)),
+                    Admission::Unsendable
+                );
+            }
+            limiter.admit(&message(new_peak_opcode(), 16))
+        };
+
+        assert_eq!(
+            probe(Direction::Inbound),
+            Admission::Deferred,
+            "a second `other` opcode was admitted after two refused frames -- the non_tx COUNT \
+             aggregate was not charged, so an oversized flood cannot exhaust the shared budget"
+        );
+        assert_eq!(
+            probe(Direction::Outbound),
+            Admission::Admitted,
+            "the fixture cannot distinguish the directions"
+        );
+    }
+
+    /// The inbound charge reaches the shared `non_tx` SIZE aggregate too.
+    ///
+    /// `non_tx_max_total_size` is the budget the worked example actually drains, and it is a
+    /// separate field from the count: a fix that charged only the count would pass the test above
+    /// and still let a flood of large refused frames run free. The count budget is left wide open
+    /// here so that only the size aggregate can produce the refusal.
+    #[test]
+    fn an_inbound_refusal_is_charged_against_the_non_tx_size_aggregate() {
+        let probe = |direction| {
+            let mut table = V2_RATE_LIMITS.clone();
+            table.non_tx_frequency = 1000.0;
+            // Two oversized frames (10 KiB + 1 each) exceed this; one legal probe alone does not.
+            table.non_tx_max_total_size = 15.0 * 1024.0;
+            table.other.insert(
+                ProtocolMessageTypes::Handshake,
+                RateLimit::new(100.0, 10.0 * 1024.0, None),
+            );
+            table.other.insert(
+                ProtocolMessageTypes::NewPeak,
+                RateLimit::new(100.0, 10.0 * 1024.0, None),
+            );
+
+            let mut limiter =
+                OpcodeRateLimiter::new(direction, 60, 1.0, OpcodeRateLimits::from(&table));
+            for _ in 0..2 {
+                assert_eq!(
+                    limiter.admit(&message(handshake_opcode(), OVERSIZED_HANDSHAKE)),
+                    Admission::Unsendable
+                );
+            }
+            limiter.admit(&message(new_peak_opcode(), 16))
+        };
+
+        assert_eq!(
+            probe(Direction::Inbound),
+            Admission::Deferred,
+            "the non_tx SIZE aggregate was not charged for refused frames -- a flood of large \
+             rejected frames still costs the peer nothing"
+        );
+        assert_eq!(
+            probe(Direction::Outbound),
+            Admission::Admitted,
+            "the fixture cannot distinguish the directions"
+        );
     }
 
     /// The table is DERIVED, not copied: a Chia opcode with a specific entry upstream must have
@@ -398,7 +607,8 @@ mod tests {
     /// neither blocked outright nor unlimited. Sending one message must pass.
     #[test]
     fn dig_opcodes_fall_back_to_the_default_budget() {
-        let mut limiter = OpcodeRateLimiter::new(60, 1.0, OpcodeRateLimits::default());
+        let mut limiter =
+            OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
         assert!(limiter.allow(&message(DIG_MESSAGE, 16)));
     }
 
@@ -408,7 +618,7 @@ mod tests {
     fn frequency_budget_admits_up_to_the_bound_and_refuses_past_it() {
         let limits = OpcodeRateLimits::default();
         let allowance = limits.default_settings.frequency as usize;
-        let mut limiter = OpcodeRateLimiter::new(60, 1.0, limits);
+        let mut limiter = OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, limits);
 
         for i in 0..allowance {
             assert!(
@@ -434,7 +644,7 @@ mod tests {
         let allowance = limits.default_settings.frequency as usize;
         let max_size = limits.default_settings.max_size as usize;
 
-        let mut exhausted = OpcodeRateLimiter::new(60, 1.0, limits);
+        let mut exhausted = OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, limits);
         for _ in 0..allowance {
             assert_eq!(
                 exhausted.admit(&message(DIG_MESSAGE, 1)),
@@ -447,7 +657,8 @@ mod tests {
             "an exhausted frequency budget resets on the next window, so waiting can help"
         );
 
-        let mut fresh = OpcodeRateLimiter::new(60, 1.0, OpcodeRateLimits::default());
+        let mut fresh =
+            OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
         assert_eq!(
             fresh.admit(&message(DIG_MESSAGE, max_size + 1)),
             Admission::Unsendable,
@@ -465,10 +676,12 @@ mod tests {
     fn size_cap_is_pinned_from_both_sides() {
         let max_size = OpcodeRateLimits::default().default_settings.max_size as usize;
 
-        let mut at_bound = OpcodeRateLimiter::new(60, 1.0, OpcodeRateLimits::default());
+        let mut at_bound =
+            OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
         assert!(at_bound.allow(&message(DIG_MESSAGE, max_size)));
 
-        let mut over_bound = OpcodeRateLimiter::new(60, 1.0, OpcodeRateLimits::default());
+        let mut over_bound =
+            OpcodeRateLimiter::new(Direction::Outbound, 60, 1.0, OpcodeRateLimits::default());
         assert!(!over_bound.allow(&message(DIG_MESSAGE, max_size + 1)));
     }
 

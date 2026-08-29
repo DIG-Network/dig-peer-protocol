@@ -17,7 +17,9 @@ use std::{
 };
 
 use dig_peer_protocol::Bytes;
-use dig_peer_protocol::{DigLink, DigMessage, LinkOptions, HOLDINGS_ANNOUNCE};
+use dig_peer_protocol::{
+    DigLink, DigMessage, LinkOptions, DIG_MESSAGE, HOLDINGS_ANNOUNCE, STORE_MELTED,
+};
 use tokio::io::DuplexStream;
 use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
 
@@ -116,7 +118,11 @@ async fn a_flood_of_unmatched_ids_cannot_wedge_the_correlated_reply_path() {
 
     let response = tokio::time::timeout(
         PATIENCE,
-        requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"ping".to_vec())),
+        requester.request_dig(
+            HOLDINGS_ANNOUNCE,
+            &[HOLDINGS_ANNOUNCE],
+            Bytes::new(b"ping".to_vec()),
+        ),
     )
     .await
     .expect("the flood wedged the reader: no correlated reply was ever routed")
@@ -138,7 +144,11 @@ async fn an_unanswered_request_errors_on_its_deadline() {
 
     let outcome = tokio::time::timeout(
         PATIENCE,
-        requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"ping".to_vec())),
+        requester.request_dig(
+            HOLDINGS_ANNOUNCE,
+            &[HOLDINGS_ANNOUNCE],
+            Bytes::new(b"ping".to_vec()),
+        ),
     )
     .await
     .expect("the request hung past its deadline");
@@ -172,7 +182,11 @@ async fn a_late_reply_to_a_timed_out_request_is_not_misrouted_to_the_next_waiter
         // The peer_rx will deliver the message regardless.
         let _ = tokio::time::timeout(
             PATIENCE,
-            requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"question-A".to_vec())),
+            requester.request_dig(
+                HOLDINGS_ANNOUNCE,
+                &[HOLDINGS_ANNOUNCE],
+                Bytes::new(b"question-A".to_vec()),
+            ),
         )
         .await
         .expect("request A should have timed out, not hung");
@@ -204,7 +218,11 @@ async fn a_late_reply_to_a_timed_out_request_is_not_misrouted_to_the_next_waiter
 
     let b_response = tokio::time::timeout(
         PATIENCE,
-        requester.request_dig(HOLDINGS_ANNOUNCE, Bytes::new(b"question-B".to_vec())),
+        requester.request_dig(
+            HOLDINGS_ANNOUNCE,
+            &[HOLDINGS_ANNOUNCE],
+            Bytes::new(b"question-B".to_vec()),
+        ),
     )
     .await
     .expect("request B hung")
@@ -217,4 +235,79 @@ async fn a_late_reply_to_a_timed_out_request_is_not_misrouted_to_the_next_waiter
     );
 
     peer_task.await.expect("peer task finished");
+}
+
+/// An inbound REQUEST that happens to carry an id we are waiting on goes to the application,
+/// not to the waiter.
+///
+/// Both peers allocate correlation ids from their own counter, and both counters start at 0, so
+/// a collision is the normal case rather than a rare one — dig-gossip's keepalive has both ends
+/// issuing a request on the same cadence over a fresh link. Completing a waiter on the ID ALONE
+/// makes that collision fatal in both directions at once: our request receives the peer's
+/// *request* frame and fails to parse it as a reply, while the peer's request never reaches the
+/// application, so we never answer it and both ends time each other out.
+///
+/// The fixture drives the real collision rather than mocking it: the peer replies to the exact
+/// id it was asked on, first with a REQUEST opcode and only then with the expected reply. Two
+/// assertions are needed, and neither alone is sufficient — that the request is delivered to the
+/// application, and that the waiter is STILL PENDING afterwards. A waiter wrongly completed with
+/// the request would satisfy neither, and the closing real reply proves the waiter survived
+/// intact rather than merely having been abandoned.
+#[tokio::test]
+async fn an_inbound_request_sharing_our_id_is_delivered_to_the_application() {
+    let (peer, mut peer_rx, requester, mut requester_rx) =
+        linked_pair(LinkOptions::default()).await;
+
+    let peer_task = tokio::spawn(async move {
+        let ours = peer_rx.recv().await.expect("the peer receives our request");
+
+        // The peer's OWN request, which merely allocated the same id from its own counter. It is
+        // a request opcode, so it is not an answer to anything we asked.
+        peer.send_message(DigMessage::new(
+            DIG_MESSAGE,
+            ours.id,
+            Bytes::new(b"the-peers-own-request".to_vec()),
+        ))
+        .await
+        .expect("the peer sends its own request");
+
+        // Only now the genuine reply.
+        peer.send_message(DigMessage::new(
+            STORE_MELTED,
+            ours.id,
+            Bytes::new(b"the-real-reply".to_vec()),
+        ))
+        .await
+        .expect("the peer sends the real reply");
+    });
+
+    let response = tokio::time::timeout(
+        PATIENCE,
+        requester.request_dig(
+            DIG_MESSAGE,
+            &[STORE_MELTED],
+            Bytes::new(b"our-request".to_vec()),
+        ),
+    )
+    .await
+    .expect("the request hung")
+    .expect("the request errored");
+
+    assert_eq!(
+        response.data.as_ref(),
+        b"the-real-reply",
+        "the waiter was completed by the peer's REQUEST rather than by its reply"
+    );
+
+    let delivered = tokio::time::timeout(PATIENCE, requester_rx.recv())
+        .await
+        .expect("the peer's request was never delivered to the application")
+        .expect("the inbound channel closed");
+    assert_eq!(
+        delivered.data.as_ref(),
+        b"the-peers-own-request",
+        "the application received something other than the peer's request"
+    );
+
+    peer_task.await.expect("the peer finished");
 }

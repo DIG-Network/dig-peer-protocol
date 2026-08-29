@@ -39,8 +39,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, warn};
 
 use crate::{
-    rate_limit::{Admission, OpcodeRateLimiter, OpcodeRateLimits},
-    request_map::RequestMap,
+    rate_limit::{Admission, Direction, OpcodeRateLimiter, OpcodeRateLimits},
+    request_map::{Correlation, Request, RequestMap},
     Bytes, DigMessage, LinkError,
 };
 
@@ -240,6 +240,9 @@ impl DigLink {
             requests,
             socket_addr,
             outbound_rate_limiter: Mutex::new(OpcodeRateLimiter::new(
+                // The send path: we chose not to send, so a refusal must not penalise a caller
+                // that backs off and retries.
+                Direction::Outbound,
                 RATE_LIMIT_WINDOW_SECONDS,
                 options.rate_limit_factor,
                 OpcodeRateLimits::default(),
@@ -313,18 +316,37 @@ impl DigLink {
         Ok(())
     }
 
-    /// Send a Chia-typed body and await the correlated reply, unparsed.
-    pub async fn request_raw<T>(&self, body: T) -> Result<DigMessage, LinkError>
+    /// Send a Chia-typed body and await the correlated reply of type `R`, unparsed.
+    ///
+    /// `R` names the reply that completes the request. It is required rather than inferred
+    /// because a correlation id alone cannot identify a reply: both peers allocate ids from their
+    /// own counter, so the peer's *request* can carry an id we are waiting on. See
+    /// [`RequestMap::take`](crate::request_map::RequestMap::take).
+    pub async fn request_raw<R, B>(&self, body: B) -> Result<DigMessage, LinkError>
     where
-        T: Streamable + ChiaProtocolMessage,
+        R: ChiaProtocolMessage,
+        B: Streamable + ChiaProtocolMessage,
     {
-        self.request_message(opcode_of::<T>()?, body.to_bytes()?.into())
-            .await
+        self.request_message(
+            opcode_of::<B>()?,
+            body.to_bytes()?.into(),
+            vec![opcode_of::<R>()?],
+        )
+        .await
     }
 
-    /// Send a DIG-band body and await the correlated reply, unparsed.
-    pub async fn request_dig(&self, opcode: u8, data: Bytes) -> Result<DigMessage, LinkError> {
-        self.request_message(opcode, data).await
+    /// Send a DIG-band body and await a correlated reply carrying one of `expected`, unparsed.
+    ///
+    /// The reply opcodes are the caller's to state: the link deliberately knows nothing about
+    /// which DIG opcode answers which, and guessing would put protocol semantics into a
+    /// transport. Listing more than one accommodates a protocol with an accept/reject pair.
+    pub async fn request_dig(
+        &self,
+        opcode: u8,
+        expected: &[u8],
+        data: Bytes,
+    ) -> Result<DigMessage, LinkError> {
+        self.request_message(opcode, data, expected.to_vec()).await
     }
 
     /// Send a Chia-typed body and await a reply of exactly one expected type.
@@ -334,7 +356,12 @@ impl DigLink {
         B: Streamable + ChiaProtocolMessage,
     {
         let expected = opcode_of::<T>()?;
-        let message = self.request_raw(body).await?;
+        let message = self
+            .request_message(opcode_of::<B>()?, body.to_bytes()?.into(), vec![expected])
+            .await?;
+        // Defence in depth: `request_message` only resolves on a declared opcode, so this
+        // cannot fire today. It is kept because the guarantee lives in another module, and a
+        // silently mis-parsed body is a worse failure than a redundant comparison.
         if message.msg_type != expected {
             return Err(LinkError::InvalidResponse(vec![expected], message.msg_type));
         }
@@ -349,13 +376,21 @@ impl DigLink {
         B: Streamable + ChiaProtocolMessage,
     {
         let (accepted, rejected) = (opcode_of::<T>()?, opcode_of::<E>()?);
-        let message = self.request_raw(body).await?;
+        let message = self
+            .request_message(
+                opcode_of::<B>()?,
+                body.to_bytes()?.into(),
+                vec![accepted, rejected],
+            )
+            .await?;
 
         if message.msg_type == accepted {
             Ok(Ok(T::from_bytes(&message.data)?))
         } else if message.msg_type == rejected {
             Ok(Err(E::from_bytes(&message.data)?))
         } else {
+            // Unreachable for the same reason as in `request_infallible`, and kept for the same
+            // reason: the exhaustive arm must not guess which of the two bodies to parse.
             Err(LinkError::InvalidResponse(
                 vec![accepted, rejected],
                 message.msg_type,
@@ -368,24 +403,41 @@ impl DigLink {
     /// The wait is bounded by [`LinkOptions::request_timeout`]. On expiry the id is reclaimed
     /// immediately rather than left occupying the map until the link drops — an unbounded wait
     /// against a silent peer leaks ids as well as hanging the caller.
-    async fn request_message(&self, opcode: u8, data: Bytes) -> Result<DigMessage, LinkError> {
+    async fn request_message(
+        &self,
+        opcode: u8,
+        data: Bytes,
+        expected: Vec<u8>,
+    ) -> Result<DigMessage, LinkError> {
         let (sender, receiver) = oneshot::channel();
-        let id = self.0.requests.insert(sender).await;
+        let id = self.0.requests.insert(sender, expected).await;
 
         if let Err(error) = self
             .send_message(DigMessage::new(opcode, Some(id), data))
             .await
         {
-            self.0.requests.remove(id).await;
+            self.0.requests.cancel(id).await;
             return Err(error);
         }
 
         match tokio::time::timeout(self.0.options.request_timeout, receiver).await {
             Ok(received) => Ok(received?),
-            Err(_) => {
-                self.0.requests.remove(id).await;
-                Err(LinkError::RequestTimeout(opcode))
-            }
+            Err(_) => Err(
+                match self
+                    .0
+                    .requests
+                    .cancel(id)
+                    .await
+                    .and_then(Request::into_diagnosis)
+                {
+                    // The peer did answer on this id — just never with anything this request asked
+                    // for. Reporting a bare timeout would describe a silent peer, which is a
+                    // different fault with a different remedy, and would give a peer-penalty layer
+                    // nothing to charge the sender for.
+                    Some((expected, found)) => LinkError::InvalidResponse(expected, found),
+                    None => LinkError::RequestTimeout(opcode),
+                },
+            ),
         }
     }
 
@@ -425,12 +477,31 @@ fn peer_addr_of(ws: &WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Socke
 ///
 /// 1. **Decoding never depends on the opcode being known.** `DigMessage::from_bytes` accepts any
 ///    `u8`, so an inbound DIG opcode is a normal message rather than a fatal decode error.
-/// 2. **An unmatched correlation id is delivered, not fatal.** Upstream returns `Err` — which
-///    ends the loop and drops the connection — when a reply arrives for an id it is not waiting
-///    on. But ids are chosen independently by each side, so a peer's *request* id routinely
-///    collides with one of our outstanding request ids; and a hostile peer could drop the link at
-///    will by sending one unknown id. Here, anything not matching a live waiter goes to the
-///    application, which is where an inbound request belongs anyway.
+/// 2. **An unmatched frame is delivered, not fatal.** Upstream returns `Err` — which ends the
+///    loop and drops the connection — when a reply arrives for an id it is not waiting on. But
+///    ids are chosen independently by each side, so a peer's *request* id routinely collides with
+///    one of our outstanding request ids; and a hostile peer could drop the link at will by
+///    sending one unknown id. Here, anything not matching a live waiter goes to the application,
+///    which is where an inbound request belongs anyway.
+///
+///    "Matching" means the id AND the opcode. A live id is not on its own evidence that a frame
+///    answers our request: because both counters start at 0, the peer's own request frequently
+///    carries an id we are waiting on, and completing the waiter with it loses the request and
+///    fails the reply in one step. A waiter is therefore *answered* only by an opcode it declared.
+///
+///    A frame carrying a live id under an undeclared opcode is delivered to the application and
+///    the waiter stays parked, because at this point the two situations that produce one are
+///    indistinguishable: an honest peer's own request that happened to allocate the same id,
+///    whose real reply is still in flight, and a peer answering with junk, whose real reply
+///    never will. They are literally the same bytes, so failing the waiter on arrival would
+///    resolve the ambiguity in favour of the second and let any peer abort an outstanding
+///    request by guessing a low id.
+///
+///    The collision is instead RECORDED against the waiter, which costs nothing if the real
+///    reply arrives. If the deadline expires instead, the caller is told what did arrive —
+///    [`LinkError::InvalidResponse`] naming the declared opcodes and the offending one — rather
+///    than a bare `RequestTimeout` that would describe a silent peer, a different fault with a
+///    different remedy and nothing for a peer-penalty layer to charge.
 /// 3. **A frame that does not decode is skipped, not fatal.** Websocket frames are
 ///    self-delimiting: tungstenite hands this loop whole `Binary` payloads, and the loop never
 ///    reads a length off a byte stream itself. So an undecodable payload costs exactly that
@@ -468,12 +539,19 @@ async fn read_inbound(
                 };
 
                 let unmatched = match message.id {
-                    Some(id) => match requests.remove(id).await {
-                        Some(waiter) => {
+                    Some(id) => match requests.take(id, message.msg_type).await {
+                        Correlation::Answer(waiter) => {
                             waiter.send(message);
                             continue;
                         }
-                        None => message,
+                        Correlation::Undeclared => {
+                            warn!(
+                                "opcode {} arrived on live request id {id}, undeclared",
+                                message.msg_type
+                            );
+                            message
+                        }
+                        Correlation::Unknown => message,
                     },
                     None => message,
                 };
