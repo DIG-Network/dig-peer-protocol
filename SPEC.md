@@ -376,6 +376,8 @@ A reply
 whose opcode matches none of the expected ones MUST fail with `LinkError::InvalidResponse`
 carrying the raw opcodes — never a `ProtocolMessageTypes`, which cannot name a DIG opcode.
 
+An implementation MUST NOT treat `InvalidResponse` from the at-deadline path as sufficient evidence of misbehaviour on its own, because an honest peer whose own request collides on a low-numbered id and whose reply arrives after the deadline will produce exactly this error — a scenario §7.2 describes as routine. `InvalidResponse` MAY be used as one input among several for peer assessment, or as a signal to retry the address.
+
 ### 7.4 Rate limiting
 
 Outbound messages MUST pass an `OpcodeRateLimiter` before being written, and an inbound
