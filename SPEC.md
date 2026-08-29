@@ -350,20 +350,39 @@ frame under overload is permitted and expected.
 unused `u16` id, send with that id, and resolve when a matching reply arrives.
 Concurrent requests MUST be bounded by the id space so an id is always available.
 
-**A waiter MUST be completed on the id AND the opcode, never on the id alone.** Every request
-records the reply opcode(s) that may complete it — supplied by the caller (`request_dig`) or
-derived from the reply type (`request_raw`, `request_infallible`, `request_fallible`) — and a
-frame carrying a live id but any other opcode MUST be delivered to the application with the
-waiter left pending. Each side allocates ids from its own counter starting at 0, so the peer's
-own *request* routinely carries an id we are waiting on; completing the waiter with it both
-fails that request (the frame is not a reply and will not parse as one) and loses the peer's
-request (the application never sees it, so it is never answered), which times out both ends of
-the link at once. An implementation MUST NOT infer reply opcodes from a built-in table of
+**A waiter MUST NOT be answered on the id alone: the reply opcode MUST match too.** Every
+request records the reply opcode(s) that may complete it — supplied by the caller
+(`request_dig`) or derived from the reply type (`request_raw`, `request_infallible`,
+`request_fallible`). An implementation MUST NOT infer reply opcodes from a built-in table of
 protocol semantics; the link does not know which opcode answers which.
 
+A frame carrying a live request id under an opcode that request did not declare MUST be
+delivered to the application and MUST NOT complete the waiter. Each side allocates ids from its
+own counter starting at 0, so the peer's own *request* routinely carries an id we are waiting
+on; handing it to the waiter both fails that request (the frame is not a reply and will not
+parse as one) and loses the peer's request (the application never sees it, so it is never
+answered). It is also the hijack: a peer holding a live id could otherwise choose what an
+outstanding request returns.
+
+An implementation MUST NOT fail the waiter at that moment either. The two situations that
+produce such a frame — an honest id collision whose real reply is still in flight, and a peer
+answering with junk whose real reply will never come — are the same bytes on the wire and
+cannot be told apart on arrival. Failing on arrival resolves that ambiguity in favour of the
+second, breaking every honest collision and handing any peer a one-frame abort of an
+outstanding request by guessing a low id.
+
+The collision MUST instead be recorded against the waiter. If the real reply arrives, the
+request completes normally and the record costs nothing. If the deadline expires with a
+collision recorded, the request MUST fail with `LinkError::InvalidResponse` naming the declared
+opcodes and the offending one as raw `u8` — never a `ProtocolMessageTypes`, which cannot name a
+DIG opcode — rather than with `RequestTimeout`. The two are different faults with different
+remedies: `RequestTimeout` says the peer was silent, `InvalidResponse` says the peer answered
+with something that answers nothing asked, which is what a peer-penalty layer charges for.
+
 Every request MUST carry a deadline (`LinkOptions::request_timeout`). On expiry the request
-MUST fail with `LinkError::RequestTimeout` and its id MUST be reclaimed immediately, so a
-silent peer can neither hang the caller indefinitely nor exhaust the id space.
+MUST fail — with `LinkError::RequestTimeout`, or with `LinkError::InvalidResponse` where a
+collision was recorded above — and its id MUST be reclaimed immediately, so a silent peer can
+neither hang the caller indefinitely nor exhaust the id space.
 
 Ids MUST be allocated from a monotonically advancing wrapping cursor rather than
 lowest-free-first, so a reclaimed id is not reissued until the id space has wrapped. Reclaiming
@@ -371,10 +390,6 @@ an id at the deadline otherwise hands it straight to the next request, and a rep
 late — answering the request that already timed out — then matches the new waiter and is
 delivered to it as though it were that request's answer. Nothing downstream can detect the
 substitution, so this MUST be prevented at allocation.
-
-A reply
-whose opcode matches none of the expected ones MUST fail with `LinkError::InvalidResponse`
-carrying the raw opcodes — never a `ProtocolMessageTypes`, which cannot name a DIG opcode.
 
 ### 7.4 Rate limiting
 
