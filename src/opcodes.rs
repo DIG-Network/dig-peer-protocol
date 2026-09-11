@@ -237,9 +237,13 @@ mod tests {
     /// so this asserts the exact contiguous triple as a slice.
     #[test]
     fn the_profile_sync_triple_is_assigned_together() {
-        let tail = &ALL_DIG_OPCODES[ALL_DIG_OPCODES.len() - 3..];
+        let start = ALL_DIG_OPCODES
+            .iter()
+            .position(|&op| op == PROFILE_ROOT_ANNOUNCE)
+            .expect("PROFILE_ROOT_ANNOUNCE must be present");
+        let triple = &ALL_DIG_OPCODES[start..start + 3];
         assert_eq!(
-            tail,
+            triple,
             [PROFILE_ROOT_ANNOUNCE, PROFILE_BODY_REQUEST, PROFILE_BODY]
         );
     }
