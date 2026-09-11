@@ -1,4 +1,4 @@
-//! The complete DIG opcode namespace — the `200..=225` band, in one place.
+//! The complete DIG opcode namespace — the `200..=226` band, in one place.
 //!
 //! DIG extends Chia's `ProtocolMessageTypes` (which stops at `RespondCostInfo = 107`) with a
 //! band that starts at **200**, leaving a 100-value gap for future upstream additions. The band
@@ -81,9 +81,7 @@ pub const PROFILE_BODY: u8 = 225;
 /// §5.4 public-broadcast carve-out as [`STORE_MELTED`] and [`HOLDINGS_ANNOUNCE`].
 ///
 /// Body layout (encoded downstream in dig-gossip, not this crate): `store_id(32) ‖
-/// launcher_id_count(u16 BE) ‖ launcher_ids(32 each, ≤ 32)`. An empty list is a positive
-/// statement that the sender knows of no distributor for that store, distinct from not
-/// announcing at all.
+/// launcher_id_count(u16 BE) ‖ launcher_ids(32 each, ≤ 32)`.
 ///
 /// **Deliberately unsigned**, for the same reason [`PROFILE_ROOT_ANNOUNCE`] is: the authority
 /// for a distributor is the on-chain coin, not the announcing peer, so a receiver re-derives
@@ -92,10 +90,33 @@ pub const PROFILE_BODY: u8 = 225;
 /// DHT-poisoning threat for a signature to close — a forged announce costs a receiver one
 /// wasted chain lookup that then fails that compare.
 ///
+/// **A frame asserts membership only, and never completeness.** The launcher ids present are
+/// ids the sender claims to know of for that `store_id`. The absence of an id from a frame
+/// asserts nothing at all — not that the sender doesn't know of it, not that it has been
+/// evicted, nothing.
+///
+/// A receiver **MUST union** a received frame into whatever set it already holds for that
+/// store; it **MUST NOT** replace its per-store set from a frame, and it **MUST NOT** diff two
+/// frames against each other to infer a removal. This is what makes eviction
+/// **unrepresentable** on this wire: because absence carries no meaning, `old_set \ new_set` is
+/// never a signal, so a receiver that unions can never manufacture a false eviction
+/// (dig_ecosystem §12.5 clause 7). Age out an entry locally on your own retention policy, never
+/// on a peer's frame.
+///
+/// A sender who knows of more than `MAX_LAUNCHER_IDS_PER_ANNOUNCE` (32) distributors for one
+/// store sends **any subset of at most 32** and MAY rotate which subset it sends across frames.
+/// Because a frame is never a completeness claim, sending a partial subset is honest by
+/// construction — it is not truncation, and it cannot forge an eviction the way silently
+/// dropping ids from a claimed-complete snapshot would.
+///
+/// An **empty** launcher-id list is a distinct, positive statement in its own right: "my known
+/// set for this store is empty" — not "I have nothing to say." It is how this wire says "I know
+/// of none" instead of saying nothing, and a receiver MUST NOT read it as a request to clear
+/// what it already holds (see the union rule above).
+///
 /// A received announce is a **hint only**: it must not admit an entry, rank a candidate, or be
-/// a claim's authority, and it is a full-replacement snapshot per store with no per-id remove
-/// operation, so "evicted" is unencodable and therefore unreconstructable
-/// (dig_ecosystem §12.5 clause 7).
+/// a claim's authority. A peer that never hears one MUST still find and claim via §13.1 —
+/// this opcode is a latency shortcut, never a dependency (dig_ecosystem §13.2 clause 2).
 pub const DISTRIBUTOR_ANNOUNCE: u8 = 226;
 
 /// Every opcode DIG has assigned, ascending — the 20 consensus opcodes plus the 7 free-band ones.
