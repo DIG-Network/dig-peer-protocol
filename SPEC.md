@@ -321,7 +321,7 @@ importing the underlying crates:
 | `chia-traits` | `Streamable` |
 | `chia_streamable_macro` | `streamable` (proc macro) |
 | DIG extensions | `Bytes`, `NodeType`, `UnknownNodeType`, `DigMessage`, `DigMessageType`, `UnknownDigMessageType`, `RegisterPeer`, `RegisterAck`, `RequestPeersIntroducer`, `RespondPeersIntroducer` |
-| DIG opcodes | `DIG_BAND_START`, `FREE_BAND_START`, `DIG_MESSAGE`, `STORE_MELTED`, `HOLDINGS_ANNOUNCE`, `PROFILE_ROOT_ANNOUNCE`, `PROFILE_BODY_REQUEST`, `PROFILE_BODY`, `ALL_DIG_OPCODES`, `is_dig_opcode` |
+| DIG opcodes | `DIG_BAND_START`, `FREE_BAND_START`, `DIG_MESSAGE`, `STORE_MELTED`, `HOLDINGS_ANNOUNCE`, `PROFILE_ROOT_ANNOUNCE`, `PROFILE_BODY_REQUEST`, `PROFILE_BODY`, `DISTRIBUTOR_ANNOUNCE`, `ALL_DIG_OPCODES`, `is_dig_opcode` |
 | DIG peer link (§7) | `DigLink`, `LinkOptions`, `LinkError`, `OpcodeRateLimiter`, `OpcodeRateLimits` |
 
 Removing or changing the signature/semantics of any re-exported or DIG-extension item is
