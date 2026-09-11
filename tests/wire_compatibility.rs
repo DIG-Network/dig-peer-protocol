@@ -70,6 +70,31 @@ fn dig_message_encodes_byte_identically_to_chia_message() {
     }
 }
 
+/// `DISTRIBUTOR_ANNOUNCE` is reachable from the crate root, not just inside `src/opcodes.rs`.
+///
+/// The opcode's own module tests (`src/opcodes.rs`) import it via `super::` and pass whether or
+/// not `src/lib.rs` re-exports it, because they sit below the module boundary the re-export is
+/// supposed to cross. Every path here is written fully qualified through `dig_peer_protocol::`
+/// so the assertions — and the test file itself — fail to COMPILE if the re-export in
+/// `src/lib.rs` is ever removed, which is strictly stronger evidence than a runtime check.
+#[test]
+fn distributor_announce_is_reachable_from_the_crate_root() {
+    assert_eq!(
+        dig_peer_protocol::DISTRIBUTOR_ANNOUNCE,
+        226,
+        "the canonical wire value moved"
+    );
+    assert!(
+        dig_peer_protocol::ALL_DIG_OPCODES.contains(&dig_peer_protocol::DISTRIBUTOR_ANNOUNCE),
+        "DISTRIBUTOR_ANNOUNCE is re-exported but missing from the enumeration a consumer would \
+         use to validate an inbound opcode"
+    );
+    assert!(
+        dig_peer_protocol::is_dig_opcode(dig_peer_protocol::DISTRIBUTOR_ANNOUNCE),
+        "is_dig_opcode must recognise the constant it is re-exported alongside"
+    );
+}
+
 #[test]
 fn dig_message_decodes_what_chia_message_encoded() {
     for opcode in all_chia_opcodes() {

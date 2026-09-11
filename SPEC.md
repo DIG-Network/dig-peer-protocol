@@ -1,7 +1,7 @@
 # dig-peer-protocol — Normative Specification
 
 This document is the authoritative contract for the `dig-peer-protocol` crate: the DIG Network
-L2 P2P message layer. It specifies the wire framing, the DIG opcode namespace (200–225),
+L2 P2P message layer. It specifies the wire framing, the DIG opcode namespace (200–226),
 the introducer registration messages, the peer link that carries them, the re-exported
 Chia protocol surface, and the invariants an implementation MUST uphold.
 
@@ -19,7 +19,7 @@ The README covers usage; this document covers the contract.
 1. Re-exports the Chia protocol ecosystem (`chia-protocol`, `chia-sdk-client`,
    `chia-ssl`, `chia-traits`, `chia_streamable_macro`) so consumers depend on
    `dig-peer-protocol` alone (§6).
-2. Defines the DIG opcode band **200–225** as a disjoint extension of Chia's
+2. Defines the DIG opcode band **200–226** as a disjoint extension of Chia's
    `ProtocolMessageTypes` namespace (§3): a consensus half (200–219, `DigMessageType`)
    and a free half (220+, application protocols).
 3. Defines `DigMessage`, a framing type that is **byte-identical on the wire** to
@@ -41,7 +41,7 @@ Every message on a DIG P2P connection uses the following framing, identical to
 
 ```
 offset  size        field       meaning
-0       1           msg_type    raw u8 opcode (Chia 0–107 or DIG 200–225)
+0       1           msg_type    raw u8 opcode (Chia 0–107 or DIG 200–226)
 1       1           has_id      0x00 = no id; any non-zero value = id present
 2       2 (if id)   id          u16 correlation id, big-endian
 +0      4           data_len    u32 payload length, big-endian
@@ -121,7 +121,7 @@ derive their opcode from `ChiaProtocolMessage` (§7). That is the only supported
   `is_chia_standard()` is `msg_type < 200`. The boundary is exactly 200
   (199 is Chia-standard, 200 is DIG-extension).
 
-## 3. DIG opcode namespace — the 200–225 band
+## 3. DIG opcode namespace — the 200–226 band
 
 ### 3.1 The 200+ convention (normative)
 
@@ -185,19 +185,55 @@ opcode says nothing about what its payload means.
 | 223 | `PROFILE_ROOT_ANNOUNCE` | Public flood | Sender's current profile-SMT root for a store; body is exactly 64 bytes, `store_id ‖ root` |
 | 224 | `PROFILE_BODY_REQUEST` | Directed | Asks one peer for the profile body behind an announced root; body is exactly 64 bytes, `store_id ‖ root` |
 | 225 | `PROFILE_BODY` | Directed | The requested profile body; `store_id ‖ root ‖ len:u32be ‖ body` |
+| 226 | `DISTRIBUTOR_ANNOUNCE` | Public flood | Untrusted reward-distributor discovery hints for a store: `store_id ‖ launcher_id_count:u16be ‖ launcher_ids` (32 bytes each, at most 32) |
 
-221, 222 and 223 are public all-peers broadcasts addressed to everyone, so they are
+221, 222, 223 and 226 are public all-peers broadcasts addressed to everyone, so they are
 mTLS-authenticated but MUST NOT be recipient-sealed (the §5.4 public-broadcast carve-out).
 220, 224 and 225 are directed; 220's payload MUST already be sealed by its producer, and a
 transport MUST NOT seal, open, or parse any free-band body.
 
-`PROFILE_ROOT_ANNOUNCE` (223) is the one broadcast in the band that is **unsigned**, by
-design. A profile root's authority is the on-chain root, so a receiver MUST verify any
+`PROFILE_ROOT_ANNOUNCE` (223) and `DISTRIBUTOR_ANNOUNCE` (226) are the broadcasts in this
+band that are **unsigned**, by design: in both, the authority is on chain rather than in the
+announcing peer, so a signature would add no guarantee the mandatory chain check does not
+already provide, at the cost of a verification on every message of the band's highest-volume
+broadcasts. A profile root's authority is the on-chain root, so a receiver MUST verify any
 announced root against chain before acting on it; a forged announce therefore costs an
 attacker at most one wasted `PROFILE_BODY_REQUEST` whose answer fails that comparison. A
-signature would add no guarantee the chain check does not already provide, at the cost of a
-verification on every message of the band's highest-volume broadcast. Implementations MUST
-NOT treat an unsigned 223 as authoritative, and MUST NOT reject one for lacking a signature.
+distributor's authority is its on-chain coin, not the announcing peer, so a receiver MUST
+re-derive every property from chain before a launcher id becomes a candidate; and because a
+226 frame carries no addresses — unlike `HOLDINGS_ANNOUNCE` (222) — there is no
+address-rewriting or holder-set-poisoning threat for a signature to close, so a forged
+announce likewise costs an attacker at most one wasted on-chain lookup that then fails that
+comparison. Implementations MUST NOT treat `PROFILE_ROOT_ANNOUNCE` (223) or `DISTRIBUTOR_ANNOUNCE` (226) as authoritative, and MUST NOT reject either for lacking a signature; an opcode the §3.2a registry defines as signed MUST still be rejected when unsigned.
+
+`DISTRIBUTOR_ANNOUNCE` (226) carries **hints, never authority** (`dig_ecosystem#3252`, epic
+#3246). A frame asserts **membership only, never completeness**: the launcher ids present
+are ids the sender claims to know of for that `store_id`, and the absence of an id asserts
+nothing at all — not that the sender does not know of it, not that it was evicted. A
+receiver MUST union a received frame into whatever set it already holds for that store; it
+MUST NOT replace its per-store set from a frame, and MUST NOT diff two frames against each
+other to infer a removal. That is what makes eviction **unrepresentable** on this wire:
+because absence carries no meaning, `old_set \ new_set` is never a signal, so a receiver
+that unions can never manufacture a false eviction (`dig_ecosystem` SPEC §12.5 clause 7).
+This holds on the bytes and not merely on receiver conduct: because any subset may be sent and rotated, a frame that omits an id is byte-identical whether the sender never knew it, knows it and rotated it out, or has dropped it, so a receiver that diffs two frames manufactures an eviction rather than recovering one.
+Entries age out on the receiver's own retention policy, never on a peer's frame.
+
+A receiver MUST NOT admit an entry, MUST NOT rank or order a candidate, and MUST NOT treat a
+received announce as a claim's authority; every property is re-derived from chain first. A
+sender that knows of more than 32 launcher ids for one store sends **any subset of at most
+32** and MAY rotate which subset it sends across frames — because a frame is never a
+completeness claim, a partial send is honest by construction and is not truncation. A sender MAY omit known ids from any frame at any count, not only when it knows more than the cap, so a frame carrying fewer than the maximum is not thereby complete. An
+**empty** launcher-id list is a distinct positive statement in its own right, "my known set
+for this store is empty" rather than "I have nothing to say"; it MUST NOT be read as a
+request to clear what the receiver already holds. 226 is **optional by design**: a peer that
+never hears a hint MUST still find and claim through its own chain scan (`dig_ecosystem`
+SPEC §13.2 clause 2), so the opcode buys latency, never correctness.
+
+The 226 body is encoded and its bounds enforced by the consuming transport (`dig-gossip`),
+not by this crate, which assigns the opcode and frames it; the bounds are stated here
+because they are part of the cross-implementation contract: at most **32** launcher ids per
+frame; a maximum body (`data_len`, §2.1) of **1058 bytes** (`32 + 2 + 32 × 32`); an inbound
+rate of **6 frames per minute per connection**.
 
 ### 3.3 Conversion and error behavior
 
@@ -285,7 +321,7 @@ importing the underlying crates:
 | `chia-traits` | `Streamable` |
 | `chia_streamable_macro` | `streamable` (proc macro) |
 | DIG extensions | `Bytes`, `NodeType`, `UnknownNodeType`, `DigMessage`, `DigMessageType`, `UnknownDigMessageType`, `RegisterPeer`, `RegisterAck`, `RequestPeersIntroducer`, `RespondPeersIntroducer` |
-| DIG opcodes | `DIG_BAND_START`, `FREE_BAND_START`, `DIG_MESSAGE`, `STORE_MELTED`, `HOLDINGS_ANNOUNCE`, `PROFILE_ROOT_ANNOUNCE`, `PROFILE_BODY_REQUEST`, `PROFILE_BODY`, `ALL_DIG_OPCODES`, `is_dig_opcode` |
+| DIG opcodes | `DIG_BAND_START`, `FREE_BAND_START`, `DIG_MESSAGE`, `STORE_MELTED`, `HOLDINGS_ANNOUNCE`, `PROFILE_ROOT_ANNOUNCE`, `PROFILE_BODY_REQUEST`, `PROFILE_BODY`, `DISTRIBUTOR_ANNOUNCE`, `ALL_DIG_OPCODES`, `is_dig_opcode` |
 | DIG peer link (§7) | `DigLink`, `LinkOptions`, `LinkError`, `OpcodeRateLimiter`, `OpcodeRateLimits` |
 
 Removing or changing the signature/semantics of any re-exported or DIG-extension item is
@@ -484,7 +520,7 @@ Runtime configuration is limited to `LinkOptions` (§7), which scales the outbou
 
 1. **Framing is frozen.** The §2.1 byte layout is byte-identical to
    `chia_protocol::Message` and MUST NOT change.
-2. **Opcode registry is append-only.** Assigned values 200–225 (§3.2, §3.2a) are
+2. **Opcode registry is append-only.** Assigned values 200–226 (§3.2, §3.2a) are
    permanent; new opcodes extend the band upward, never reuse or renumber.
 3. **Payload encodings are append-compatible per Chia Streamable rules** — the
    `RegisterPeer`/`RegisterAck` field lists (§4) are fixed; any evolution must keep old
@@ -498,7 +534,7 @@ Runtime configuration is limited to `LinkOptions` (§7), which scales the outbou
 |---|-------------|-------------|
 | C1 | Frame layout `[u8 type][u8 has_id][u16 id?][u32 len][data]`, big-endian, matches `chia_protocol::Message` | §2.1; round-trip + boundary tests in `src/dig_message.rs` |
 | C2 | Decoder accepts any opcode; truncated input → `None`, never panic; `data_len` above `MAX_MESSAGE_SIZE` (16 MiB) → `None` before slicing/allocating; offset arithmetic is overflow-checked on every target width | §2.2; truncation + oversized-length + overflow tests in `src/dig_message.rs` |
-| C3 | DIG band is exactly 200–225 with no gaps and no collision with any opcode `chia-protocol` accepts; dispatch boundary at 200 | §3.1–3.2a; disjointness/contiguity/boundary tests in `src/opcodes.rs`, range tests in `src/dig_message_type.rs` |
+| C3 | DIG band is exactly 200–226 with no gaps and no collision with any opcode `chia-protocol` accepts; dispatch boundary at 200 | §3.1–3.2a; disjointness/contiguity/boundary tests in `src/opcodes.rs`, range tests in `src/dig_message_type.rs` |
 | C4 | `TryFrom<u8>` rejects every non-assigned value with `UnknownDigMessageType` | §3.3; `unknown_rejected` test |
 | C5 | `DigMessageType` serde = raw u8 discriminant | §3.4; serde tests in `src/dig_message_type.rs` |
 | C6 | `RegisterPeer` = (`ip: String`, `port: u16`, `node_type: NodeType`) at opcode 218; `RegisterAck` = (`success: bool`) at 219; wrong opcode → `None`, corrupt body → `Err`; `success=false` is valid | §4; round-trip + decode-error tests in `src/introducer_wire.rs` |
