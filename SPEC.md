@@ -204,8 +204,7 @@ re-derive every property from chain before a launcher id becomes a candidate; an
 226 frame carries no addresses — unlike `HOLDINGS_ANNOUNCE` (222) — there is no
 address-rewriting or holder-set-poisoning threat for a signature to close, so a forged
 announce likewise costs an attacker at most one wasted on-chain lookup that then fails that
-comparison. Implementations MUST NOT treat an unsigned broadcast in this band as
-authoritative, and MUST NOT reject one for lacking a signature.
+comparison. Implementations MUST NOT treat `PROFILE_ROOT_ANNOUNCE` (223) or `DISTRIBUTOR_ANNOUNCE` (226) as authoritative, and MUST NOT reject either for lacking a signature; an opcode the §3.2a registry defines as signed MUST still be rejected when unsigned.
 
 `DISTRIBUTOR_ANNOUNCE` (226) carries **hints, never authority** (`dig_ecosystem#3252`, epic
 #3246). A frame asserts **membership only, never completeness**: the launcher ids present
@@ -216,13 +215,14 @@ MUST NOT replace its per-store set from a frame, and MUST NOT diff two frames ag
 other to infer a removal. That is what makes eviction **unrepresentable** on this wire:
 because absence carries no meaning, `old_set \ new_set` is never a signal, so a receiver
 that unions can never manufacture a false eviction (`dig_ecosystem` SPEC §12.5 clause 7).
+This holds on the bytes and not merely on receiver conduct: because any subset may be sent and rotated, a frame that omits an id is byte-identical whether the sender never knew it, knows it and rotated it out, or has dropped it, so a receiver that diffs two frames manufactures an eviction rather than recovering one.
 Entries age out on the receiver's own retention policy, never on a peer's frame.
 
 A receiver MUST NOT admit an entry, MUST NOT rank or order a candidate, and MUST NOT treat a
 received announce as a claim's authority; every property is re-derived from chain first. A
 sender that knows of more than 32 launcher ids for one store sends **any subset of at most
 32** and MAY rotate which subset it sends across frames — because a frame is never a
-completeness claim, a partial send is honest by construction and is not truncation. An
+completeness claim, a partial send is honest by construction and is not truncation. A sender MAY omit known ids from any frame at any count, not only when it knows more than the cap, so a frame carrying fewer than the maximum is not thereby complete. An
 **empty** launcher-id list is a distinct positive statement in its own right, "my known set
 for this store is empty" rather than "I have nothing to say"; it MUST NOT be read as a
 request to clear what the receiver already holds. 226 is **optional by design**: a peer that
