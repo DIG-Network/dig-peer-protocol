@@ -74,11 +74,35 @@ pub const PROFILE_BODY_REQUEST: u8 = 224;
 /// needs no signature.
 pub const PROFILE_BODY: u8 = 225;
 
-/// Every opcode DIG has assigned, ascending — the 20 consensus opcodes plus the 6 free-band ones.
+/// Wire opcode for a **distributor-announce** broadcast (DIG-Network/dig_ecosystem#3252).
+///
+/// A public all-peers flood carrying untrusted reward-distributor discovery hints: a
+/// `store_id` plus the launcher ids of distributors the sender knows of for that store. Same
+/// §5.4 public-broadcast carve-out as [`STORE_MELTED`] and [`HOLDINGS_ANNOUNCE`].
+///
+/// Body layout (encoded downstream in dig-gossip, not this crate): `store_id(32) ‖
+/// launcher_id_count(u16 BE) ‖ launcher_ids(32 each, ≤ 32)`. An empty list is a positive
+/// statement that the sender knows of no distributor for that store, distinct from not
+/// announcing at all.
+///
+/// **Deliberately unsigned**, for the same reason [`PROFILE_ROOT_ANNOUNCE`] is: the authority
+/// for a distributor is the on-chain coin, not the announcing peer, so a receiver re-derives
+/// every property from chain before the launcher id becomes a candidate. Unlike
+/// [`HOLDINGS_ANNOUNCE`], the frame carries no addresses, so there is no address-rewriting or
+/// DHT-poisoning threat for a signature to close — a forged announce costs a receiver one
+/// wasted chain lookup that then fails that compare.
+///
+/// A received announce is a **hint only**: it must not admit an entry, rank a candidate, or be
+/// a claim's authority, and it is a full-replacement snapshot per store with no per-id remove
+/// operation, so "evicted" is unencodable and therefore unreconstructable
+/// (dig_ecosystem §12.5 clause 7).
+pub const DISTRIBUTOR_ANNOUNCE: u8 = 226;
+
+/// Every opcode DIG has assigned, ascending — the 20 consensus opcodes plus the 7 free-band ones.
 ///
 /// This is the list a peer link dispatches on and the list a conformance test checks against
 /// Chia's namespace for collisions.
-pub const ALL_DIG_OPCODES: [u8; 26] = [
+pub const ALL_DIG_OPCODES: [u8; 27] = [
     DigMessageType::NewAttestation as u8,
     DigMessageType::NewCheckpointProposal as u8,
     DigMessageType::NewCheckpointSignature as u8,
@@ -105,6 +129,7 @@ pub const ALL_DIG_OPCODES: [u8; 26] = [
     PROFILE_ROOT_ANNOUNCE,
     PROFILE_BODY_REQUEST,
     PROFILE_BODY,
+    DISTRIBUTOR_ANNOUNCE,
 ];
 
 /// Whether `opcode` belongs to the DIG band rather than Chia's namespace.
@@ -120,8 +145,9 @@ pub const fn is_dig_opcode(opcode: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_dig_opcode, ALL_DIG_OPCODES, DIG_BAND_START, DIG_MESSAGE, FREE_BAND_START,
-        HOLDINGS_ANNOUNCE, PROFILE_BODY, PROFILE_BODY_REQUEST, PROFILE_ROOT_ANNOUNCE, STORE_MELTED,
+        is_dig_opcode, ALL_DIG_OPCODES, DIG_BAND_START, DIG_MESSAGE, DISTRIBUTOR_ANNOUNCE,
+        FREE_BAND_START, HOLDINGS_ANNOUNCE, PROFILE_BODY, PROFILE_BODY_REQUEST,
+        PROFILE_ROOT_ANNOUNCE, STORE_MELTED,
     };
     use chia_protocol::ProtocolMessageTypes;
     use chia_traits::Streamable;
@@ -144,7 +170,7 @@ mod tests {
     /// opcode was silently dropped from the list, a duplicate that two protocols share a byte.
     #[test]
     fn the_assigned_band_is_contiguous_from_200() {
-        let expected: Vec<u8> = (DIG_BAND_START..=PROFILE_BODY).collect();
+        let expected: Vec<u8> = (DIG_BAND_START..=DISTRIBUTOR_ANNOUNCE).collect();
         assert_eq!(ALL_DIG_OPCODES.to_vec(), expected);
     }
 
@@ -159,6 +185,50 @@ mod tests {
         assert_eq!(PROFILE_ROOT_ANNOUNCE, 223);
         assert_eq!(PROFILE_BODY_REQUEST, 224);
         assert_eq!(PROFILE_BODY, 225);
+        assert_eq!(DISTRIBUTOR_ANNOUNCE, 226);
+    }
+
+    /// `DISTRIBUTOR_ANNOUNCE` is a canonical constant (DIG-Network/dig_ecosystem#3252): a
+    /// second implementation must match this value byte for byte, so it is pinned as a literal
+    /// the same way the other free-band opcodes are.
+    #[test]
+    fn distributor_announce_is_pinned_to_226() {
+        assert_eq!(DISTRIBUTOR_ANNOUNCE, 226);
+    }
+
+    /// `ALL_DIG_OPCODES` must enumerate `DISTRIBUTOR_ANNOUNCE` — this is the only mechanism
+    /// that gives a 220-band opcode a rate limit in dig-gossip's exhaustiveness test
+    /// (`inbound_limits.rs`); an opcode missing from this array silently falls through to the
+    /// loose default rate-limit settings (the #1720/#1760-D fail-open bug).
+    #[test]
+    fn all_dig_opcodes_contains_distributor_announce() {
+        assert!(ALL_DIG_OPCODES.contains(&DISTRIBUTOR_ANNOUNCE));
+    }
+
+    /// `ALL_DIG_OPCODES` has no duplicates and is strictly ascending — a duplicate would mean
+    /// two protocols silently sharing one byte, a non-ascending entry would mean a copy/paste
+    /// error when a new opcode was appended.
+    #[test]
+    fn all_dig_opcodes_is_deduped_and_strictly_ascending() {
+        for window in ALL_DIG_OPCODES.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "not strictly ascending at {window:?}"
+            );
+        }
+    }
+
+    /// `ALL_DIG_OPCODES` has grown to 27 entries: 20 consensus opcodes plus 7 free-band ones
+    /// now that `DISTRIBUTOR_ANNOUNCE` is assigned.
+    #[test]
+    fn all_dig_opcodes_has_27_entries() {
+        assert_eq!(ALL_DIG_OPCODES.len(), 27);
+    }
+
+    /// `is_dig_opcode` is a band test, so it must still recognize the newly assigned value.
+    #[test]
+    fn is_dig_opcode_recognizes_distributor_announce() {
+        assert!(is_dig_opcode(DISTRIBUTOR_ANNOUNCE));
     }
 
     /// The three profile-SMT opcodes are a single indivisible allocation: each one must be

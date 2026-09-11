@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "dig-peer-protocol"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "chia-protocol",
  "chia-sdk-client",
