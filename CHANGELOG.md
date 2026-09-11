@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-09-11
+
+### Features
+- **opcodes:** Allocate DISTRIBUTOR_ANNOUNCE = 226, release 0.10.0 (#15)
+
+### Chores
+- Untrack gitnexus-generated agent files (#14)
+
 ## [0.9.1] - 2026-09-04
 
 ### Documentation
